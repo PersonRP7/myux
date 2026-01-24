@@ -12,6 +12,7 @@ use windows::Win32::System::Threading::TerminateProcess;
 use windows::Win32::System::Console::GetConsoleScreenBufferInfo;
 use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, CONSOLE_SCREEN_BUFFER_INFO};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use core::ffi::c_void;
 
 fn console_size() -> (i16, i16) {
     unsafe {
@@ -37,22 +38,34 @@ fn main() -> windows::core::Result<()> {
 
     terminal::enable_raw_mode().unwrap();
 
-    // Output reader thread: read PTY output and write to our stdout
-    let out_handle = tab.pty_out_read;
+    let out_raw = tab.pty_out_read.0 as usize;  // copy the underlying pointer value
+
     let reader = std::thread::spawn(move || {
+        // Reconstruct HANDLE inside the thread
+        let out_handle = HANDLE(out_raw as *mut c_void);
+
         let mut buf = [0u8; 8192];
         loop {
             unsafe {
                 let mut read = 0u32;
-                let ok = ReadFile(out_handle, Some(&mut buf), Some(&mut read), None).as_bool();
+
+                let ok = ReadFile(
+                    out_handle,
+                    Some(&mut buf),
+                    Some(&mut read),
+                    None,
+                ).is_ok();
+
                 if !ok || read == 0 {
                     break;
                 }
+
                 let _ = io::stdout().write_all(&buf[..read as usize]);
                 let _ = io::stdout().flush();
             }
         }
     });
+
 
     // Main input loop
     loop {

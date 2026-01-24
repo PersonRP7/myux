@@ -1,6 +1,8 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
+use core::ffi::c_void;
+use windows::Win32::System::Memory::HEAP_FLAGS;
 
 use windows::core::{PCWSTR, Result};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -69,19 +71,10 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
             bInheritHandle: false.into(),
         };
 
-        CreatePipe(&mut pty_in_read, &mut pty_in_write, Some(&sa), 0).ok()?;
-        CreatePipe(&mut pty_out_read, &mut pty_out_write, Some(&sa), 0).ok()?;
+        CreatePipe(&mut pty_in_read, &mut pty_in_write, Some(&sa), 0)?;
+        CreatePipe(&mut pty_out_read, &mut pty_out_write, Some(&sa), 0)?;
 
         // 2) Create the pseudo console
-        // let mut hpcon = HPCON::default();
-        // CreatePseudoConsole(
-        //     COORD { X: cols, Y: rows },
-        //     pty_in_read,    // ConPTY reads from this
-        //     pty_out_write,  // ConPTY writes to this
-        //     0,
-        //     &mut hpcon,
-        // )
-        // .ok()?;
         let hpcon = CreatePseudoConsole(
             COORD { X: cols, Y: rows },
             pty_in_read,    // ConPTY reads from this
@@ -97,31 +90,16 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
         let mut si_ex: STARTUPINFOEXW = std::mem::zeroed();
         si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
 
-        // First call to get required buffer size
-        // let mut attr_list_size: usize = 0;
-        // let _ = InitializeProcThreadAttributeList(
-        //     None,
-        //     1,
-        //     0,
-        //     &mut attr_list_size,
-        // );
         let mut attr_list_size: usize = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(
-                null_mut(), // <- NULL pointer instead of None
-                1,
-                0,
-                &mut attr_list_size,
-            )?;
-        }
+        // First call: query required size, ignore the error (it will be
+        // ERROR_INSUFFICIENT_BUFFER, which is expected).
+        let _ = InitializeProcThreadAttributeList(
+            LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+            1,
+            0,
+            &mut attr_list_size,
+        );
 
-        // // Allocate attribute list
-        // let heap = GetProcessHeap()?;
-        // let attr_list_mem = HeapAlloc(heap, HEAP_ZERO_MEMORY, attr_list_size);
-        // if attr_list_mem.is_null() {
-        //     // windows::core::Error has constructors, but keep it simple:
-        //     return Err(windows::core::Error::from_win32());
-        // }
         // Allocate attribute list
         let heap = GetProcessHeap()?;
         let attr_list_mem = unsafe { HeapAlloc(heap, HEAP_ZERO_MEMORY, attr_list_size) };
@@ -129,18 +107,8 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
             return Err(windows::core::Error::from_win32());
         }
 
-        // si_ex.lpAttributeList = attr_list_mem as *mut _;
-        // Cast to the right pointer type and store it in STARTUPINFOEXW
-        si_ex.lpAttributeList = attr_list_mem as LPPROC_THREAD_ATTRIBUTE_LIST;
+        si_ex.lpAttributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_mem as *mut _);
 
-        // InitializeProcThreadAttributeList(
-        //     Some(si_ex.lpAttributeList),
-        //     1,
-        //     0,
-        //     &mut attr_list_size,
-        // )
-        // .ok()?;
-        // Second call: actually initialize the list
         unsafe {
             InitializeProcThreadAttributeList(
                 si_ex.lpAttributeList,
@@ -150,17 +118,15 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
             )?;
         }
 
-        // Set pseudoconsole attribute
         UpdateProcThreadAttribute(
             si_ex.lpAttributeList,
             0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-            Some(&hpcon as *const _ as *const _),
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize, // already usize
+            Some(&hpcon as *const _ as *const c_void),
             std::mem::size_of::<HPCON>(),
             None,
             None,
-        )
-        .ok()?;
+        )?;  // 👈 no .ok()
 
         // 4) Spawn child process attached to ConPTY
         // CreateProcessW requires a mutable command line buffer.
@@ -179,12 +145,15 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
             PCWSTR::null(),
             &si_ex.StartupInfo,
             &mut pi,
-        )
-        .ok()?;
+        )?;
 
         // Cleanup attribute list
         DeleteProcThreadAttributeList(si_ex.lpAttributeList);
-        HeapFree(heap, 0, Some(si_ex.lpAttributeList as *const _));
+        HeapFree(
+            heap,
+            HEAP_FLAGS(0),
+            Some(si_ex.lpAttributeList.0 as *const c_void),
+        )?;
 
         Ok(TabPty {
             hpcon,

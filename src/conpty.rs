@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::ptr::{null, null_mut};
+use std::ptr::{null_mut};
 use core::ffi::c_void;
 use windows::Win32::System::Memory::HEAP_FLAGS;
 

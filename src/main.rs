@@ -5,7 +5,7 @@ use conpty::{spawn_conpty, TabPty};
 use core::ffi::c_void;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     queue,
     style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
@@ -20,7 +20,6 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::TerminateProcess;
 
-/// Overall application state.
 struct App {
     tabs: Vec<TabPty>,
     active: usize,
@@ -34,7 +33,6 @@ impl App {
     }
 }
 
-/// Get the current console size (columns, rows).
 fn console_size() -> (i16, i16) {
     unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE).unwrap();
@@ -46,7 +44,6 @@ fn console_size() -> (i16, i16) {
     }
 }
 
-/// Write bytes to a Win32 HANDLE (ConPTY input).
 fn write_all(handle: HANDLE, bytes: &[u8]) {
     unsafe {
         let mut written = 0u32;
@@ -54,7 +51,6 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
     }
 }
 
-/// Draw a simple status bar on the bottom line.
 fn draw_status_bar(app: &App) {
     let mut stdout = io::stdout();
 
@@ -90,10 +86,9 @@ fn draw_status_bar(app: &App) {
 }
 
 fn main() -> windows::core::Result<()> {
-    // 1) Determine console size & spawn first tab
     let (cols, rows) = console_size();
     println!("Spawning ConPTY {cols}x{rows}...");
-    let first_tab = spawn_conpty("cmd.exe", cols, rows)?;
+    let first_tab = spawn_conpty("cmd.exe", cols, rows)?; // cmd.exe for clarity
 
     let out_raw: isize = first_tab.pty_out_read.0 as isize;
 
@@ -104,16 +99,26 @@ fn main() -> windows::core::Result<()> {
         rows,
     };
 
-    // 2) Enable raw mode
     terminal::enable_raw_mode().unwrap();
 
-    // 3) Draw initial status bar
+    // Initial bar (will get redrawn once the shell prints something)
     draw_status_bar(&app);
 
-    // 4) Reader thread: ConPTY output → stdout
+    // Reader thread: ConPTY output → stdout + redraw bar
+    // NOTE: we clone just the scalar fields needed for drawing.
+    let reader_cols = app.cols;
+    let reader_rows = app.rows;
     let reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
+
+        // tiny "app view" inside the thread, enough to draw the bar
+        let thread_app = App {
+            tabs: Vec::new(),        // not used here
+            active: 0,               // not used
+            cols: reader_cols,
+            rows: reader_rows,
+        };
 
         loop {
             unsafe {
@@ -132,25 +137,21 @@ fn main() -> windows::core::Result<()> {
                 let _ = io::stdout().write_all(&buf[..read as usize]);
                 let _ = io::stdout().flush();
             }
+
+            // redraw the bar after each chunk of output so it stays at the bottom
+            draw_status_bar(&thread_app);
         }
     });
 
-    // 5) Main input loop
+    // Main input loop: Esc quits, everything else goes to cmd.exe
     loop {
         if event::poll(Duration::from_millis(16)).unwrap() {
             match event::read().unwrap() {
-                Event::Key(KeyEvent {
-                    code,
-                    modifiers,
-                    kind,
-                    ..
-                }) => {
-                    // Only react on key presses
+                Event::Key(KeyEvent { code, kind, .. }) => {
                     if kind != KeyEventKind::Press {
                         continue;
                     }
 
-                    // Quit on Esc (simple, robust)
                     if code == KeyCode::Esc {
                         unsafe {
                             let _ = TerminateProcess(app.active_tab().child_process, 0);
@@ -158,7 +159,6 @@ fn main() -> windows::core::Result<()> {
                         break;
                     }
 
-                    // Forward other keys to the active tab
                     let pty_in = app.active_tab().pty_in_write;
 
                     match code {
@@ -177,6 +177,7 @@ fn main() -> windows::core::Result<()> {
                         _ => {}
                     }
 
+                    // and redraw from main side too
                     draw_status_bar(&app);
                 }
                 Event::Resize(new_cols, new_rows) => {
@@ -190,7 +191,6 @@ fn main() -> windows::core::Result<()> {
         }
     }
 
-    // 6) Cleanup
     terminal::disable_raw_mode().unwrap();
     let _ = reader.join();
 

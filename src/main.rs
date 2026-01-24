@@ -20,6 +20,7 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::TerminateProcess;
 
+/// Simple application state (one tab for now).
 struct App {
     tabs: Vec<TabPty>,
     active: usize,
@@ -33,6 +34,7 @@ impl App {
     }
 }
 
+/// Get the current console size (columns, rows).
 fn console_size() -> (i16, i16) {
     unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE).unwrap();
@@ -44,6 +46,7 @@ fn console_size() -> (i16, i16) {
     }
 }
 
+/// Write bytes to a Win32 HANDLE (ConPTY input).
 fn write_all(handle: HANDLE, bytes: &[u8]) {
     unsafe {
         let mut written = 0u32;
@@ -51,6 +54,7 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
     }
 }
 
+/// Draw a simple status bar on the bottom line.
 fn draw_status_bar(app: &App) {
     let mut stdout = io::stdout();
 
@@ -85,10 +89,28 @@ fn draw_status_bar(app: &App) {
     let _ = stdout.flush();
 }
 
+/// Clear the status bar line (used when exiting).
+fn clear_status_bar(app: &App) {
+    let mut stdout = io::stdout();
+    let (cols_u16, rows_u16) =
+        terminal::size().unwrap_or((app.cols as u16, app.rows as u16));
+    let last_row = rows_u16.saturating_sub(1);
+
+    let _ = queue!(
+        stdout,
+        cursor::SavePosition,
+        cursor::MoveTo(0, last_row),
+        Clear(ClearType::CurrentLine),
+        cursor::RestorePosition,
+    );
+    let _ = stdout.flush();
+}
+
 fn main() -> windows::core::Result<()> {
+    // 1) Spawn ConPTY with a cmd.exe child
     let (cols, rows) = console_size();
     println!("Spawning ConPTY {cols}x{rows}...");
-    let first_tab = spawn_conpty("cmd.exe", cols, rows)?; // cmd.exe for clarity
+    let first_tab = spawn_conpty("cmd.exe", cols, rows)?; // swap to "pwsh.exe" later if you like
 
     let out_raw: isize = first_tab.pty_out_read.0 as isize;
 
@@ -99,11 +121,13 @@ fn main() -> windows::core::Result<()> {
         rows,
     };
 
+    // 2) Enable raw mode and draw initial status bar
     terminal::enable_raw_mode().unwrap();
-
     draw_status_bar(&app);
 
-    // Spawn reader thread but DO NOT join it later
+    // 3) Reader thread: pump ConPTY output to stdout.
+    //    We don't bother trying to distinguish "normal" vs "error" shutdown here;
+    //    the whole process will exit on F10 anyway.
     let _reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
@@ -120,7 +144,6 @@ fn main() -> windows::core::Result<()> {
                 }
 
                 if read == 0 {
-                    eprintln!("[reader] EOF, exiting reader");
                     break;
                 }
 
@@ -130,24 +153,26 @@ fn main() -> windows::core::Result<()> {
         }
     });
 
-    // Main input loop
+    // 4) Main input loop: F10 quits, other keys go into the child
     loop {
         if event::poll(Duration::from_millis(16)).unwrap() {
             match event::read().unwrap() {
                 Event::Key(KeyEvent { code, kind, .. }) => {
-                    // Log what we see
-                    eprintln!("[key] code={:?}, kind={:?}", code, kind);
-
                     if kind != KeyEventKind::Press {
                         continue;
                     }
 
-                    // Quit on F10 OR Esc (just to be safe)
-                    if code == KeyCode::F(10) || code == KeyCode::Esc {
+                    // Brutal quit on F10:
+                    if code == KeyCode::F(10) {
                         unsafe {
-                            let _ = TerminateProcess(app.active_tab().child_process, 0);
+                            let _ =
+                                TerminateProcess(app.active_tab().child_process, 0);
                         }
-                        break;
+                        clear_status_bar(&app);
+                        // Turn off raw mode so host console behaves normally again
+                        let _ = terminal::disable_raw_mode();
+                        // Hard-exit the whole process; OS will tear down the reader thread.
+                        std::process::exit(0);
                     }
 
                     let pty_in = app.active_tab().pty_in_write;
@@ -181,8 +206,8 @@ fn main() -> windows::core::Result<()> {
         }
     }
 
-    // IMPORTANT: no join here; just clean up raw mode and exit
-    terminal::disable_raw_mode().unwrap();
-
-    Ok(())
+    // (Unreachable because of std::process::exit, but kept for completeness)
+    // clear_status_bar(&app);
+    // let _ = terminal::disable_raw_mode();
+    // Ok(())
 }

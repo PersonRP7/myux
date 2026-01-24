@@ -118,15 +118,18 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
             )?;
         }
 
+        let hpcon_raw: isize = hpcon.0; // extract the inner value
+
         UpdateProcThreadAttribute(
             si_ex.lpAttributeList,
             0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize, // already usize
-            Some(&hpcon as *const _ as *const c_void),
-            std::mem::size_of::<HPCON>(),
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+            // pass the raw value as the attribute "buffer"
+            Some(hpcon_raw as *const c_void),
+            std::mem::size_of::<isize>(),
             None,
             None,
-        )?;  // 👈 no .ok()
+        )?;
 
         // 4) Spawn child process attached to ConPTY
         // CreateProcessW requires a mutable command line buffer.

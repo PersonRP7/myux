@@ -102,21 +102,20 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
 
         // Allocate attribute list
         let heap = GetProcessHeap()?;
-        let attr_list_mem = unsafe { HeapAlloc(heap, HEAP_ZERO_MEMORY, attr_list_size) };
+        let attr_list_mem = HeapAlloc(heap, HEAP_ZERO_MEMORY, attr_list_size);
         if attr_list_mem.is_null() {
             return Err(windows::core::Error::from_win32());
         }
 
         si_ex.lpAttributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attr_list_mem as *mut _);
 
-        unsafe {
-            InitializeProcThreadAttributeList(
-                si_ex.lpAttributeList,
-                1,
-                0,
-                &mut attr_list_size,
-            )?;
-        }
+
+        InitializeProcThreadAttributeList(
+            si_ex.lpAttributeList,
+            1,
+            0,
+            &mut attr_list_size,
+        )?;
 
         let hpcon_raw: isize = hpcon.0; // extract the inner value
 

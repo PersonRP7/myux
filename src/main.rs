@@ -236,7 +236,7 @@ fn main() -> windows::core::Result<()> {
 
     let out_raw: isize = first_tab.pty_out_read.0 as isize;
 
-    let mut app = App {
+    let app = App {
         tabs: vec![first_tab],
         active: 0,
     };

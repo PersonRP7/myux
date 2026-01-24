@@ -21,7 +21,6 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Threading::TerminateProcess;
 
 /// Overall application state.
-/// For now: one tab, but the shape is ready for multi-tab later.
 struct App {
     tabs: Vec<TabPty>,
     active: usize,
@@ -56,18 +55,15 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
 }
 
 /// Draw a simple status bar on the bottom line.
-/// For now it just shows the active tab index and total tabs.
 fn draw_status_bar(app: &App) {
     let mut stdout = io::stdout();
 
-    // Terminal size in cells (u16); fall back to app.cols/rows if needed.
     let (cols_u16, rows_u16) =
         terminal::size().unwrap_or((app.cols as u16, app.rows as u16));
     let last_row = rows_u16.saturating_sub(1);
 
-    // Status text (later: tab names, more controls, etc.)
     let text = format!(
-        "[myux] tab {}/{} | Ctrl+Q: quit",
+        "[myux] tab {}/{} | Esc: quit",
         app.active + 1,
         app.tabs.len()
     );
@@ -80,7 +76,6 @@ fn draw_status_bar(app: &App) {
         line.truncate(cols);
     }
 
-    // Save cursor, move to bottom line, draw bar, restore cursor.
     let _ = queue!(
         stdout,
         cursor::SavePosition,
@@ -98,12 +93,10 @@ fn main() -> windows::core::Result<()> {
     // 1) Determine console size & spawn first tab
     let (cols, rows) = console_size();
     println!("Spawning ConPTY {cols}x{rows}...");
-    let first_tab = spawn_conpty("pwsh.exe", cols, rows)?; // or "cmd.exe"
+    let first_tab = spawn_conpty("cmd.exe", cols, rows)?;
 
-    // Extract raw handle value for the reader thread (HANDLE is !Send)
     let out_raw: isize = first_tab.pty_out_read.0 as isize;
 
-    // Build initial app state (one tab)
     let mut app = App {
         tabs: vec![first_tab],
         active: 0,
@@ -111,13 +104,13 @@ fn main() -> windows::core::Result<()> {
         rows,
     };
 
-    // 2) Enable raw mode so we get keypresses immediately
+    // 2) Enable raw mode
     terminal::enable_raw_mode().unwrap();
 
     // 3) Draw initial status bar
     draw_status_bar(&app);
 
-    // 4) Spawn reader thread: pump ConPTY output → stdout
+    // 4) Reader thread: ConPTY output → stdout
     let reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
@@ -142,7 +135,7 @@ fn main() -> windows::core::Result<()> {
         }
     });
 
-    // 5) Main input loop: read keyboard events and forward them into active tab
+    // 5) Main input loop
     loop {
         if event::poll(Duration::from_millis(16)).unwrap() {
             match event::read().unwrap() {
@@ -152,47 +145,30 @@ fn main() -> windows::core::Result<()> {
                     kind,
                     ..
                 }) => {
-                    // Only act on actual key presses, ignore release/repeat.
+                    // Only react on key presses
                     if kind != KeyEventKind::Press {
                         continue;
                     }
 
-                    // Exit: Ctrl+Q
-                    if code == KeyCode::Char('q')
-                        && modifiers.contains(KeyModifiers::CONTROL)
-                    {
+                    // Quit on Esc (simple, robust)
+                    if code == KeyCode::Esc {
                         unsafe {
-                            let _ = TerminateProcess(
-                                app.active_tab().child_process,
-                                0,
-                            );
+                            let _ = TerminateProcess(app.active_tab().child_process, 0);
                         }
                         break;
                     }
 
-                    // For the active tab, grab its input handle (copy of HANDLE)
+                    // Forward other keys to the active tab
                     let pty_in = app.active_tab().pty_in_write;
 
                     match code {
-                        KeyCode::Enter => {
-                            write_all(pty_in, b"\r");
-                        }
+                        KeyCode::Enter => write_all(pty_in, b"\r"),
                         KeyCode::Backspace => write_all(pty_in, &[0x08]),
                         KeyCode::Tab => write_all(pty_in, b"\t"),
                         KeyCode::Char(c) => {
                             let mut s = [0u8; 4];
                             let n = c.encode_utf8(&mut s).len();
-
-                            // Ctrl+A..Ctrl+Z -> 0x01..0x1A
-                            if modifiers.contains(KeyModifiers::CONTROL)
-                                && c.is_ascii_alphabetic()
-                            {
-                                let ctrl =
-                                    (c.to_ascii_lowercase() as u8) - b'a' + 1;
-                                write_all(pty_in, &[ctrl]);
-                            } else {
-                                write_all(pty_in, &s[..n]);
-                            }
+                            write_all(pty_in, &s[..n]);
                         }
                         KeyCode::Left => write_all(pty_in, b"\x1b[D"),
                         KeyCode::Right => write_all(pty_in, b"\x1b[C"),
@@ -201,17 +177,12 @@ fn main() -> windows::core::Result<()> {
                         _ => {}
                     }
 
-                    // After handling a key, refresh the status bar
                     draw_status_bar(&app);
                 }
                 Event::Resize(new_cols, new_rows) => {
                     app.cols = new_cols as i16;
                     app.rows = new_rows as i16;
-
-                    // Resize the pseudo console to match window size
                     let _ = app.active_tab().resize(app.cols, app.rows);
-
-                    // Redraw status bar with new dimensions
                     draw_status_bar(&app);
                 }
                 _ => {}
@@ -219,7 +190,7 @@ fn main() -> windows::core::Result<()> {
         }
     }
 
-    // 6) Cleanup: disable raw mode and wait for reader to finish
+    // 6) Cleanup
     terminal::disable_raw_mode().unwrap();
     let _ = reader.join();
 

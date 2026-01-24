@@ -59,7 +59,7 @@ fn draw_status_bar(app: &App) {
     let last_row = rows_u16.saturating_sub(1);
 
     let text = format!(
-        "[myux] tab {}/{} | Esc: quit",
+        "[myux] tab {}/{} | F10: quit",
         app.active + 1,
         app.tabs.len()
     );
@@ -101,24 +101,12 @@ fn main() -> windows::core::Result<()> {
 
     terminal::enable_raw_mode().unwrap();
 
-    // Initial bar (will get redrawn once the shell prints something)
     draw_status_bar(&app);
 
-    // Reader thread: ConPTY output → stdout + redraw bar
-    // NOTE: we clone just the scalar fields needed for drawing.
-    let reader_cols = app.cols;
-    let reader_rows = app.rows;
-    let reader = thread::spawn(move || {
+    // Spawn reader thread but DO NOT join it later
+    let _reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
-
-        // tiny "app view" inside the thread, enough to draw the bar
-        let thread_app = App {
-            tabs: Vec::new(),        // not used here
-            active: 0,               // not used
-            cols: reader_cols,
-            rows: reader_rows,
-        };
 
         loop {
             unsafe {
@@ -126,33 +114,36 @@ fn main() -> windows::core::Result<()> {
 
                 let res = ReadFile(out_handle, Some(&mut buf), Some(&mut read), None);
 
-                if let Err(_) = res {
+                if let Err(err) = res {
+                    eprintln!("[reader] ReadFile error: {err:?}");
                     break;
                 }
 
                 if read == 0 {
+                    eprintln!("[reader] EOF, exiting reader");
                     break;
                 }
 
                 let _ = io::stdout().write_all(&buf[..read as usize]);
                 let _ = io::stdout().flush();
             }
-
-            // redraw the bar after each chunk of output so it stays at the bottom
-            draw_status_bar(&thread_app);
         }
     });
 
-    // Main input loop: Esc quits, everything else goes to cmd.exe
+    // Main input loop
     loop {
         if event::poll(Duration::from_millis(16)).unwrap() {
             match event::read().unwrap() {
                 Event::Key(KeyEvent { code, kind, .. }) => {
+                    // Log what we see
+                    eprintln!("[key] code={:?}, kind={:?}", code, kind);
+
                     if kind != KeyEventKind::Press {
                         continue;
                     }
 
-                    if code == KeyCode::Esc {
+                    // Quit on F10 OR Esc (just to be safe)
+                    if code == KeyCode::F(10) || code == KeyCode::Esc {
                         unsafe {
                             let _ = TerminateProcess(app.active_tab().child_process, 0);
                         }
@@ -177,7 +168,6 @@ fn main() -> windows::core::Result<()> {
                         _ => {}
                     }
 
-                    // and redraw from main side too
                     draw_status_bar(&app);
                 }
                 Event::Resize(new_cols, new_rows) => {
@@ -191,8 +181,8 @@ fn main() -> windows::core::Result<()> {
         }
     }
 
+    // IMPORTANT: no join here; just clean up raw mode and exit
     terminal::disable_raw_mode().unwrap();
-    let _ = reader.join();
 
     Ok(())
 }

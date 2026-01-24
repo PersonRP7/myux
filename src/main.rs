@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
 };
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use windows::Win32::Foundation::HANDLE;
@@ -20,30 +21,42 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::Threading::TerminateProcess;
 
-/// Simple application state (one tab for now).
+/// Runtime state for the child terminals (tabs).
 struct App {
     tabs: Vec<TabPty>,
     active: usize,
-    cols: i16,
-    rows: i16,
 }
 
+/// Helper: access active tab.
 impl App {
     fn active_tab(&self) -> &TabPty {
         &self.tabs[self.active]
     }
 }
 
-/// Get the current console size (columns, rows).
-fn console_size() -> (i16, i16) {
-    unsafe {
+/// Minimal state the status bar needs, shared between threads.
+#[derive(Clone, Copy)]
+struct StatusBarState {
+    cols: u16,
+    rows: u16,
+    active: usize,
+    tab_count: usize,
+}
+
+type StatusHandle = Arc<Mutex<StatusBarState>>;
+
+fn console_size() -> (u16, u16) {
+    // Prefer crossterm, fall back to Win32 if needed.
+    terminal::size().unwrap_or_else(|_| unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE).unwrap();
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         let _ = GetConsoleScreenBufferInfo(h, &mut info);
-        let cols = info.srWindow.Right - info.srWindow.Left + 1;
-        let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+        let cols =
+            (info.srWindow.Right - info.srWindow.Left + 1).max(1) as u16;
+        let rows =
+            (info.srWindow.Bottom - info.srWindow.Top + 1).max(1) as u16;
         (cols, rows)
-    }
+    })
 }
 
 /// Write bytes to a Win32 HANDLE (ConPTY input).
@@ -54,18 +67,25 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
     }
 }
 
-/// Draw a simple status bar on the bottom line.
-fn draw_status_bar(app: &App) {
+/// Draw the status bar on the bottom line, using shared state.
+fn draw_status_bar(status: &StatusHandle) {
+    let snap = {
+        // snapshot under the mutex, then drop the lock
+        let s = status.lock().unwrap();
+        *s
+    };
+
     let mut stdout = io::stdout();
 
+    // Live size if possible, snapshot as fallback.
     let (cols_u16, rows_u16) =
-        terminal::size().unwrap_or((app.cols as u16, app.rows as u16));
+        terminal::size().unwrap_or((snap.cols, snap.rows));
     let last_row = rows_u16.saturating_sub(1);
 
     let text = format!(
         "[myux] tab {}/{} | F10: quit",
-        app.active + 1,
-        app.tabs.len()
+        snap.active + 1,
+        snap.tab_count.max(1),
     );
 
     let mut line = text;
@@ -90,10 +110,15 @@ fn draw_status_bar(app: &App) {
 }
 
 /// Clear the status bar line (used when exiting).
-fn clear_status_bar(app: &App) {
+fn clear_status_bar(status: &StatusHandle) {
+    let snap = {
+        let s = status.lock().unwrap();
+        *s
+    };
+
     let mut stdout = io::stdout();
     let (cols_u16, rows_u16) =
-        terminal::size().unwrap_or((app.cols as u16, app.rows as u16));
+        terminal::size().unwrap_or((snap.cols, snap.rows));
     let last_row = rows_u16.saturating_sub(1);
 
     let _ = queue!(
@@ -107,27 +132,37 @@ fn clear_status_bar(app: &App) {
 }
 
 fn main() -> windows::core::Result<()> {
-    // 1) Spawn ConPTY with a cmd.exe child
+    // 1) Visible console size, reserve last row for status bar.
     let (cols, rows) = console_size();
-    println!("Spawning ConPTY {cols}x{rows}...");
-    let first_tab = spawn_conpty("cmd.exe", cols, rows)?; // swap to "pwsh.exe" later if you like
+    let conpty_rows: i16 = (rows as i16 - 1).max(1); // one less than host window
+
+    println!(
+        "Spawning ConPTY {}x{} (ConPTY rows {})...",
+        cols, rows, conpty_rows
+    );
+    let first_tab = spawn_conpty("cmd.exe", cols as i16, conpty_rows)?; // swap to "pwsh.exe" later
 
     let out_raw: isize = first_tab.pty_out_read.0 as isize;
 
     let mut app = App {
         tabs: vec![first_tab],
         active: 0,
+    };
+
+    // Shared status bar state (used by both threads)
+    let status: StatusHandle = Arc::new(Mutex::new(StatusBarState {
         cols,
         rows,
-    };
+        active: 0,
+        tab_count: 1,
+    }));
 
     // 2) Enable raw mode and draw initial status bar
     terminal::enable_raw_mode().unwrap();
-    draw_status_bar(&app);
+    draw_status_bar(&status);
 
-    // 3) Reader thread: pump ConPTY output to stdout.
-    //    We don't bother trying to distinguish "normal" vs "error" shutdown here;
-    //    the whole process will exit on F10 anyway.
+    // 3) Reader thread: ConPTY output → stdout, then redraw bar
+    let status_for_reader = Arc::clone(&status);
     let _reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
@@ -150,6 +185,9 @@ fn main() -> windows::core::Result<()> {
                 let _ = io::stdout().write_all(&buf[..read as usize]);
                 let _ = io::stdout().flush();
             }
+
+            // Keep bar pinned at bottom after each burst of output
+            draw_status_bar(&status_for_reader);
         }
     });
 
@@ -162,16 +200,14 @@ fn main() -> windows::core::Result<()> {
                         continue;
                     }
 
-                    // Brutal quit on F10:
+                    // Brutal quit on F10
                     if code == KeyCode::F(10) {
                         unsafe {
                             let _ =
                                 TerminateProcess(app.active_tab().child_process, 0);
                         }
-                        clear_status_bar(&app);
-                        // Turn off raw mode so host console behaves normally again
+                        clear_status_bar(&status);
                         let _ = terminal::disable_raw_mode();
-                        // Hard-exit the whole process; OS will tear down the reader thread.
                         std::process::exit(0);
                     }
 
@@ -193,21 +229,29 @@ fn main() -> windows::core::Result<()> {
                         _ => {}
                     }
 
-                    draw_status_bar(&app);
+                    // Main thread redraw too (after a keypress)
+                    draw_status_bar(&status);
                 }
                 Event::Resize(new_cols, new_rows) => {
-                    app.cols = new_cols as i16;
-                    app.rows = new_rows as i16;
-                    let _ = app.active_tab().resize(app.cols, app.rows);
-                    draw_status_bar(&app);
+                    // Update status bar state
+                    {
+                        let mut s = status.lock().unwrap();
+                        s.cols = new_cols;
+                        s.rows = new_rows;
+                        s.active = app.active;
+                        s.tab_count = app.tabs.len();
+                    }
+
+                    // Resize the pseudo console (still reserving bottom row)
+                    let conpty_rows = (new_rows as i16 - 1).max(1);
+                    let _ = app
+                        .active_tab()
+                        .resize(new_cols as i16, conpty_rows);
+
+                    draw_status_bar(&status);
                 }
                 _ => {}
             }
         }
     }
-
-    // (Unreachable because of std::process::exit, but kept for completeness)
-    // clear_status_bar(&app);
-    // let _ = terminal::disable_raw_mode();
-    // Ok(())
 }

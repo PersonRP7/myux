@@ -1,91 +1,136 @@
 mod conpty;
 
 use conpty::spawn_conpty;
+use core::ffi::c_void;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    terminal,
+};
 use std::io::{self, Write};
+use std::thread;
 use std::time::Duration;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use core::ffi::c_void;
+use windows::Win32::System::Console::{
+    GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+};
+use windows::Win32::System::Threading::TerminateProcess;
 
-// Helper that writes all bytes to the given HANDLE and logs the result.
+/// Get the current console size (columns, rows).
+fn console_size() -> (i16, i16) {
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE).unwrap();
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        let _ = GetConsoleScreenBufferInfo(h, &mut info);
+        let cols = info.srWindow.Right - info.srWindow.Left + 1;
+        let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+        (cols, rows)
+    }
+}
+
+/// Write bytes to a Win32 HANDLE (ConPTY input).
 fn write_all(handle: HANDLE, bytes: &[u8]) {
     unsafe {
         let mut written = 0u32;
-        let res = WriteFile(
-            handle,
-            Some(bytes),
-            Some(&mut written),
-            None,
-        );
-
-        eprintln!(
-            "[writer] WriteFile result: {:?}, requested: {}, written: {}",
-            res,
-            bytes.len(),
-            written,
-        );
+        let _ = WriteFile(handle, Some(bytes), Some(&mut written), None);
     }
 }
 
 fn main() -> windows::core::Result<()> {
-    // For now, hardcode a reasonable size instead of querying console size
-    let cols = 120;
-    let rows = 30;
+    // 1) Spawn the pseudo console with a shell
+    let (cols, rows) = console_size();
+    println!("Spawning ConPTY {cols}x{rows}...");
+    let tab = spawn_conpty("cmd.exe", cols, rows)?; // or "pwsh.exe" if you prefer
 
-    println!("Spawning ConPTY...");
-    let tab = spawn_conpty("cmd.exe", cols, rows)?; // use cmd.exe for now
-    println!("ConPTY spawned, starting reader thread...");
+    // 2) Enable raw mode so we get keypresses immediately
+    terminal::enable_raw_mode().unwrap();
+    println!("\r\n[myux] Interactive shell started. Press Ctrl+Q to exit.\r\n");
 
-    // Extract raw handle value as an integer (isize is Send)
+    // 3) Spawn a reader thread that pumps ConPTY output to stdout
+    //
+    // HANDLE isn't Send (wraps a *mut c_void), so we pass the raw integer
+    // value into the thread and reconstruct HANDLE there.
     let out_raw: isize = tab.pty_out_read.0 as isize;
 
-    let reader = std::thread::spawn(move || {
-        // Reconstruct HANDLE from the raw integer inside the thread
+    let reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
-
-        eprintln!("[reader] thread started");
 
         loop {
             unsafe {
                 let mut read = 0u32;
 
-                let res = ReadFile(
-                    out_handle,
-                    Some(&mut buf),
-                    Some(&mut read),
-                    None,
-                );
+                let res = ReadFile(out_handle, Some(&mut buf), Some(&mut read), None);
 
-                if let Err(err) = res {
-                    eprintln!("[reader] ReadFile error: {err:?}");
+                if let Err(_) = res {
+                    // Read error (pipe closed, etc.): just stop.
                     break;
                 }
 
                 if read == 0 {
-                    eprintln!("[reader] ReadFile returned 0 bytes, exiting");
+                    // EOF from the ConPTY side
                     break;
                 }
 
-                eprintln!("[reader] got {read} bytes");
                 let _ = io::stdout().write_all(&buf[..read as usize]);
                 let _ = io::stdout().flush();
             }
         }
-
-        eprintln!("[reader] exiting");
     });
 
-    // ---- Send a test command without any raw-mode / event stuff ----
-    println!("Writing \"dir\" to the pseudo console...");
-    write_all(tab.pty_in_write, b"dir\r\n");
+    // 4) Main input loop: read keyboard events and forward them into ConPTY
+    loop {
+        if event::poll(Duration::from_millis(16)).unwrap() {
+            match event::read().unwrap() {
+                Event::Key(KeyEvent { code, modifiers, .. }) => {
+                    // Exit: Ctrl+Q
+                    if code == KeyCode::Char('q') && modifiers.contains(KeyModifiers::CONTROL) {
+                        unsafe {
+                            let _ = TerminateProcess(tab.child_process, 0);
+                        }
+                        break;
+                    }
 
-    // Give the child some time to execute and print output
-    std::thread::sleep(Duration::from_secs(5));
+                    match code {
+                        KeyCode::Enter => {
+                            // "\r" is usually enough; ConPTY/console translate it,
+                            // but you can switch to "\r\n" if needed.
+                            write_all(tab.pty_in_write, b"\r");
+                        }
+                        KeyCode::Backspace => write_all(tab.pty_in_write, &[0x08]),
+                        KeyCode::Tab => write_all(tab.pty_in_write, b"\t"),
+                        KeyCode::Char(c) => {
+                            let mut s = [0u8; 4];
+                            let n = c.encode_utf8(&mut s).len();
 
-    // Drop happens here (closes handles / pseudo console) after reader finishes
+                            // Ctrl+A..Ctrl+Z -> 0x01..0x1A
+                            if modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic()
+                            {
+                                let ctrl = (c.to_ascii_lowercase() as u8) - b'a' + 1;
+                                write_all(tab.pty_in_write, &[ctrl]);
+                            } else {
+                                write_all(tab.pty_in_write, &s[..n]);
+                            }
+                        }
+                        KeyCode::Left => write_all(tab.pty_in_write, b"\x1b[D"),
+                        KeyCode::Right => write_all(tab.pty_in_write, b"\x1b[C"),
+                        KeyCode::Up => write_all(tab.pty_in_write, b"\x1b[A"),
+                        KeyCode::Down => write_all(tab.pty_in_write, b"\x1b[B"),
+                        _ => {}
+                    }
+                }
+                Event::Resize(new_cols, new_rows) => {
+                    // Resize the pseudo console to match our window size
+                    let _ = tab.resize(new_cols as i16, new_rows as i16);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 5) Cleanup: disable raw mode and wait for reader to finish
+    terminal::disable_raw_mode().unwrap();
     let _ = reader.join();
-    println!("Done.");
 
     Ok(())
 }

@@ -40,7 +40,7 @@ fn main() -> windows::core::Result<()> {
     // 1) Spawn the pseudo console with a shell
     let (cols, rows) = console_size();
     println!("Spawning ConPTY {cols}x{rows}...");
-    let tab = spawn_conpty("cmd.exe", cols, rows)?; // or "pwsh.exe" if you prefer
+    let tab = spawn_conpty("pwsh.exe", cols, rows)?; // swithc between "pwsh.exe" or "cmd.exe"
 
     // 2) Enable raw mode so we get keypresses immediately
     terminal::enable_raw_mode().unwrap();

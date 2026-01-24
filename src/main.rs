@@ -1,10 +1,14 @@
 mod conpty;
 
-use conpty::spawn_conpty;
+use conpty::{spawn_conpty, TabPty};
+
 use core::ffi::c_void;
 use crossterm::{
+    cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    terminal,
+    queue,
+    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
+    terminal::{self, Clear, ClearType},
 };
 use std::io::{self, Write};
 use std::thread;
@@ -15,6 +19,21 @@ use windows::Win32::System::Console::{
     GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::TerminateProcess;
+
+/// Overall application state.
+/// For now: one tab, but the shape is ready for multi-tab later.
+struct App {
+    tabs: Vec<TabPty>,
+    active: usize,
+    cols: i16,
+    rows: i16,
+}
+
+impl App {
+    fn active_tab(&self) -> &TabPty {
+        &self.tabs[self.active]
+    }
+}
 
 /// Get the current console size (columns, rows).
 fn console_size() -> (i16, i16) {
@@ -36,19 +55,69 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
     }
 }
 
+/// Draw a simple status bar on the bottom line.
+/// For now it just shows the active tab index and total tabs.
+fn draw_status_bar(app: &App) {
+    let mut stdout = io::stdout();
+
+    // Terminal size in cells (u16); fall back to app.cols/rows if needed.
+    let (cols_u16, rows_u16) =
+        terminal::size().unwrap_or((app.cols as u16, app.rows as u16));
+    let last_row = rows_u16.saturating_sub(1);
+
+    // Status text (later: tab names, more controls, etc.)
+    let text = format!(
+        "[myux] tab {}/{} | Ctrl+Q: quit",
+        app.active + 1,
+        app.tabs.len()
+    );
+
+    let mut line = text;
+    let cols = cols_u16 as usize;
+    if line.len() < cols {
+        line.push_str(&" ".repeat(cols - line.len()));
+    } else {
+        line.truncate(cols);
+    }
+
+    // Save cursor, move to bottom line, draw bar, restore cursor.
+    let _ = queue!(
+        stdout,
+        cursor::SavePosition,
+        cursor::MoveTo(0, last_row),
+        Clear(ClearType::CurrentLine),
+        SetBackgroundColor(Color::DarkGrey),
+        SetForegroundColor(Color::White),
+    );
+    let _ = write!(stdout, "{}", line);
+    let _ = queue!(stdout, ResetColor, cursor::RestorePosition);
+    let _ = stdout.flush();
+}
+
 fn main() -> windows::core::Result<()> {
-    // 1) Spawn the pseudo console with a shell
+    // 1) Determine console size & spawn first tab
     let (cols, rows) = console_size();
     println!("Spawning ConPTY {cols}x{rows}...");
-    let tab = spawn_conpty("pwsh.exe", cols, rows)?; // swithc between "pwsh.exe" or "cmd.exe"
+    let first_tab = spawn_conpty("pwsh.exe", cols, rows)?; // or "cmd.exe"
+
+    // Extract raw handle value for the reader thread (HANDLE is !Send)
+    let out_raw: isize = first_tab.pty_out_read.0 as isize;
+
+    // Build initial app state (one tab)
+    let mut app = App {
+        tabs: vec![first_tab],
+        active: 0,
+        cols,
+        rows,
+    };
 
     // 2) Enable raw mode so we get keypresses immediately
     terminal::enable_raw_mode().unwrap();
-    println!("\r\n[myux] Interactive shell started. Press Ctrl+Q to exit.\r\n");
 
-    // 3) Spawn a reader thread that pumps ConPTY output to stdout
-    let out_raw: isize = tab.pty_out_read.0 as isize;
+    // 3) Draw initial status bar
+    draw_status_bar(&app);
 
+    // 4) Spawn reader thread: pump ConPTY output → stdout
     let reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
@@ -73,59 +142,84 @@ fn main() -> windows::core::Result<()> {
         }
     });
 
-    // 4) Main input loop: read keyboard events and forward them into ConPTY
+    // 5) Main input loop: read keyboard events and forward them into active tab
     loop {
         if event::poll(Duration::from_millis(16)).unwrap() {
             match event::read().unwrap() {
-                Event::Key(KeyEvent { code, modifiers, kind, .. }) => {
-                    // Only act on actual key presses, ignore release/repeat
+                Event::Key(KeyEvent {
+                    code,
+                    modifiers,
+                    kind,
+                    ..
+                }) => {
+                    // Only act on actual key presses, ignore release/repeat.
                     if kind != KeyEventKind::Press {
                         continue;
                     }
 
                     // Exit: Ctrl+Q
-                    if code == KeyCode::Char('q') && modifiers.contains(KeyModifiers::CONTROL) {
+                    if code == KeyCode::Char('q')
+                        && modifiers.contains(KeyModifiers::CONTROL)
+                    {
                         unsafe {
-                            let _ = TerminateProcess(tab.child_process, 0);
+                            let _ = TerminateProcess(
+                                app.active_tab().child_process,
+                                0,
+                            );
                         }
                         break;
                     }
 
+                    // For the active tab, grab its input handle (copy of HANDLE)
+                    let pty_in = app.active_tab().pty_in_write;
+
                     match code {
                         KeyCode::Enter => {
-                            write_all(tab.pty_in_write, b"\r");
+                            write_all(pty_in, b"\r");
                         }
-                        KeyCode::Backspace => write_all(tab.pty_in_write, &[0x08]),
-                        KeyCode::Tab => write_all(tab.pty_in_write, b"\t"),
+                        KeyCode::Backspace => write_all(pty_in, &[0x08]),
+                        KeyCode::Tab => write_all(pty_in, b"\t"),
                         KeyCode::Char(c) => {
                             let mut s = [0u8; 4];
                             let n = c.encode_utf8(&mut s).len();
 
                             // Ctrl+A..Ctrl+Z -> 0x01..0x1A
-                            if modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic()
+                            if modifiers.contains(KeyModifiers::CONTROL)
+                                && c.is_ascii_alphabetic()
                             {
-                                let ctrl = (c.to_ascii_lowercase() as u8) - b'a' + 1;
-                                write_all(tab.pty_in_write, &[ctrl]);
+                                let ctrl =
+                                    (c.to_ascii_lowercase() as u8) - b'a' + 1;
+                                write_all(pty_in, &[ctrl]);
                             } else {
-                                write_all(tab.pty_in_write, &s[..n]);
+                                write_all(pty_in, &s[..n]);
                             }
                         }
-                        KeyCode::Left => write_all(tab.pty_in_write, b"\x1b[D"),
-                        KeyCode::Right => write_all(tab.pty_in_write, b"\x1b[C"),
-                        KeyCode::Up => write_all(tab.pty_in_write, b"\x1b[A"),
-                        KeyCode::Down => write_all(tab.pty_in_write, b"\x1b[B"),
+                        KeyCode::Left => write_all(pty_in, b"\x1b[D"),
+                        KeyCode::Right => write_all(pty_in, b"\x1b[C"),
+                        KeyCode::Up => write_all(pty_in, b"\x1b[A"),
+                        KeyCode::Down => write_all(pty_in, b"\x1b[B"),
                         _ => {}
                     }
+
+                    // After handling a key, refresh the status bar
+                    draw_status_bar(&app);
                 }
                 Event::Resize(new_cols, new_rows) => {
-                    let _ = tab.resize(new_cols as i16, new_rows as i16);
+                    app.cols = new_cols as i16;
+                    app.rows = new_rows as i16;
+
+                    // Resize the pseudo console to match window size
+                    let _ = app.active_tab().resize(app.cols, app.rows);
+
+                    // Redraw status bar with new dimensions
+                    draw_status_bar(&app);
                 }
                 _ => {}
             }
         }
     }
 
-    // 5) Cleanup: disable raw mode and wait for reader to finish
+    // 6) Cleanup: disable raw mode and wait for reader to finish
     terminal::disable_raw_mode().unwrap();
     let _ = reader.join();
 

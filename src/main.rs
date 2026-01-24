@@ -3,7 +3,7 @@ mod conpty;
 use conpty::spawn_conpty;
 use core::ffi::c_void;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
 };
 use std::io::{self, Write};
@@ -47,9 +47,6 @@ fn main() -> windows::core::Result<()> {
     println!("\r\n[myux] Interactive shell started. Press Ctrl+Q to exit.\r\n");
 
     // 3) Spawn a reader thread that pumps ConPTY output to stdout
-    //
-    // HANDLE isn't Send (wraps a *mut c_void), so we pass the raw integer
-    // value into the thread and reconstruct HANDLE there.
     let out_raw: isize = tab.pty_out_read.0 as isize;
 
     let reader = thread::spawn(move || {
@@ -63,12 +60,10 @@ fn main() -> windows::core::Result<()> {
                 let res = ReadFile(out_handle, Some(&mut buf), Some(&mut read), None);
 
                 if let Err(_) = res {
-                    // Read error (pipe closed, etc.): just stop.
                     break;
                 }
 
                 if read == 0 {
-                    // EOF from the ConPTY side
                     break;
                 }
 
@@ -82,7 +77,12 @@ fn main() -> windows::core::Result<()> {
     loop {
         if event::poll(Duration::from_millis(16)).unwrap() {
             match event::read().unwrap() {
-                Event::Key(KeyEvent { code, modifiers, .. }) => {
+                Event::Key(KeyEvent { code, modifiers, kind, .. }) => {
+                    // Only act on actual key presses, ignore release/repeat
+                    if kind != KeyEventKind::Press {
+                        continue;
+                    }
+
                     // Exit: Ctrl+Q
                     if code == KeyCode::Char('q') && modifiers.contains(KeyModifiers::CONTROL) {
                         unsafe {
@@ -93,8 +93,6 @@ fn main() -> windows::core::Result<()> {
 
                     match code {
                         KeyCode::Enter => {
-                            // "\r" is usually enough; ConPTY/console translate it,
-                            // but you can switch to "\r\n" if needed.
                             write_all(tab.pty_in_write, b"\r");
                         }
                         KeyCode::Backspace => write_all(tab.pty_in_write, &[0x08]),
@@ -120,7 +118,6 @@ fn main() -> windows::core::Result<()> {
                     }
                 }
                 Event::Resize(new_cols, new_rows) => {
-                    // Resize the pseudo console to match our window size
                     let _ = tab.resize(new_cols as i16, new_rows as i16);
                 }
                 _ => {}

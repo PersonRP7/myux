@@ -4,8 +4,8 @@ mod terminal;
 mod renderer;
 
 use conpty::{spawn_conpty, TabPty};
-use terminal::VirtualTerminal;
 use renderer::Renderer;
+use terminal::VirtualTerminal;
 
 use core::ffi::c_void;
 use crossterm::{
@@ -20,10 +20,11 @@ use std::time::Duration;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode,
-    CONSOLE_SCREEN_BUFFER_INFO, CONSOLE_MODE, ENABLE_PROCESSED_OUTPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleScreenBufferSize,
+    SetConsoleMode, CONSOLE_SCREEN_BUFFER_INFO, CONSOLE_MODE,
+    ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
 };
+use windows::Win32::System::Console::COORD;
 use windows::Win32::System::Threading::TerminateProcess;
 
 struct Tab {
@@ -60,6 +61,25 @@ fn enable_vt_mode() {
     }
 }
 
+/// Make the console buffer height match the window height
+/// so there is no native scrollback/scrollbar fighting us.
+fn clamp_console_buffer_to_window() {
+    unsafe {
+        if let Ok(h) = GetStdHandle(STD_OUTPUT_HANDLE) {
+            let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+            if GetConsoleScreenBufferInfo(h, &mut info).is_ok() {
+                let width = info.srWindow.Right - info.srWindow.Left + 1;
+                let height = info.srWindow.Bottom - info.srWindow.Top + 1;
+                let size = COORD {
+                    X: width as i16,
+                    Y: height as i16,
+                };
+                let _ = SetConsoleScreenBufferSize(h, size);
+            }
+        }
+    }
+}
+
 fn console_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or_else(|_| unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE).unwrap();
@@ -80,16 +100,16 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
 }
 
 fn main() -> windows::core::Result<()> {
-    // 1) Enable VT on host console and get size.
+    // 1) Enable VT on host console and clamp buffer to window.
     enable_vt_mode();
+    clamp_console_buffer_to_window();
     let (cols, rows) = console_size();
 
     // 2) Spawn a single ConPTY-backed cmd.exe.
     println!("Spawning ConPTY {}x{}...", cols, rows);
     let pty = spawn_conpty("cmd.exe", cols as i16, rows as i16)?;
 
-
- // We capture the raw value of the output handle for the reader thread.
+    // We capture the raw value of the output handle for the reader thread.
     let out_raw: isize = pty.pty_out_read.0 as isize;
 
     let term = VirtualTerminal::new(cols, rows);
@@ -134,11 +154,10 @@ fn main() -> windows::core::Result<()> {
     )
     .ok();
 
-
     let mut app = app;
     let mut renderer = Renderer::new();
 
-    // Hide cursor once.
+    // Hide cursor once; renderer no longer hides it every frame.
     crossterm::execute!(io::stdout(), cursor::Hide).ok();
 
     // Track whether we need to redraw.
@@ -164,6 +183,7 @@ fn main() -> windows::core::Result<()> {
             match event::read().unwrap() {
                 Event::Key(KeyEvent { code, kind, .. }) => {
                     if kind != KeyEventKind::Press {
+                        // ignore repeats / releases
                         continue;
                     }
 
@@ -174,7 +194,6 @@ fn main() -> windows::core::Result<()> {
                             let _ = TerminateProcess(child, 0);
                         }
                         disable_raw_mode().ok();
-                        // Show cursor again on exit.
                         crossterm::execute!(
                             io::stdout(),
                             cursor::Show,
@@ -209,7 +228,9 @@ fn main() -> windows::core::Result<()> {
                 }
 
                 Event::Resize(new_cols, new_rows) => {
+                    // Resize VT
                     app.active_tab_mut().term.resize(new_cols, new_rows);
+                    // Resize ConPTY
                     let _ = app
                         .active_tab()
                         .pty

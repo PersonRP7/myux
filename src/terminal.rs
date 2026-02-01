@@ -1,81 +1,94 @@
 // src/terminal.rs
 
+use vt100::Parser;
 
+/// A virtual terminal backed by vt100.
+/// - `rows` / `cols` are the *physical* console size.
+/// - We reserve the last physical row for the status bar.
+/// - The vt100 screen height is therefore `rows - 1`.
 pub struct VirtualTerminal {
+    parser: Parser,
     cols: u16,
-    rows: u16,
-    /// Very simple: each entry is a logical line of text.
-    lines: Vec<String>,
+    rows: u16,      // physical rows (incl. status bar)
+    term_rows: u16, // rows dedicated to the child terminal (rows - 1)
 }
 
 impl VirtualTerminal {
     pub fn new(cols: u16, rows: u16) -> Self {
+        // At least 1 row for the child.
+        let term_rows = rows.saturating_sub(1).max(1);
+
+        // vt100 takes: height, width, history.
+        let parser = Parser::new(term_rows as u16, cols as u16, 0);
+
         Self {
+            parser,
             cols,
             rows,
-            lines: vec![String::new()],
+            term_rows,
         }
     }
 
+    /// Physical console size (what the renderer cares about).
     pub fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
 
+    /// Called when the host console is resized.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-            self.cols = cols;
-            self.rows = rows;
-            let max_visible = rows.saturating_sub(1) as usize;
-            if max_visible > 0 && self.lines.len() > max_visible {
-                let drop = self.lines.len() - max_visible;
-                self.lines.drain(0..drop);
-            }
-        }
+        self.cols = cols;
+        self.rows = rows;
 
-    /// Feed raw bytes from ConPTY into our model.
-    /// For now:
-    ///   - treat everything as UTF-8 text,
-    ///   - split on '\n',
-    ///   - keep only the most recent `rows - 1` lines.
+        let term_rows = rows.saturating_sub(1).max(1);
+        self.term_rows = term_rows;
+
+        // Resize the vt100 screen. Newer vt100 versions have set_size(height, width, history).
+        // If your version only has set_size(height, width), just drop the history argument.
+        self.parser.set_size(term_rows as u16, cols as u16);
+    }
+
+    /// Feed raw bytes from ConPTY into the VT parser.
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-
-        let s = String::from_utf8_lossy(bytes);
-
-        // Ensure we have at least one line.
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-
-        for ch in s.chars() {
-            match ch {
-                '\n' => {
-                    // New logical line.
-                    self.lines.push(String::new());
-                }
-                '\r' => {
-                    // Carriage return: for now, just ignore (real VT would move cursor).
-                    // Later, when you replace this with a proper VT parser, this logic goes away.
-                }
-                _ => {
-                    if let Some(last) = self.lines.last_mut() {
-                        last.push(ch);
-                    }
-                }
-            }
-        }
-
-        // Cap visible lines to `rows - 1`
-        let max_visible = self.rows.saturating_sub(1) as usize;
-        if max_visible > 0 && self.lines.len() > max_visible {
-            let drop = self.lines.len() - max_visible;
-            self.lines.drain(0..drop);
-        }
+        self.parser.process(bytes);
     }
 
-    /// Lines that should be displayed (top to bottom).
-    pub fn visible_lines(&self) -> &[String] {
-        &self.lines
+    /// Render the current screen contents (no status bar) as plain text lines.
+    /// We strip *all* control/escape handling; vt100 has already applied it.
+    pub fn render_lines(&self) -> Vec<String> {
+        let screen = self.parser.screen();
+        let rows = self.term_rows as i32;
+        let cols = self.cols as i32;
+
+        let mut out = Vec::with_capacity(self.term_rows as usize);
+
+        for row in 0..rows {
+            let mut line = String::new();
+
+            for col in 0..cols {
+                if let Some(cell) = screen.cell(row as u16, col as u16) {
+                    let ch = cell.contents();
+                    // vt100 uses '\0' for empty cells.
+                    if ch != "\0" {
+                        line.push_str(&ch);
+                    } else {
+                        line.push(' ');
+                    }
+                } else {
+                    line.push(' ');
+                }
+            }
+
+            // Trim trailing spaces for aesthetics.
+            while line.ends_with(' ') {
+                line.pop();
+            }
+
+            out.push(line);
+        }
+
+        out
     }
 }

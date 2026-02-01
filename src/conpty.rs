@@ -166,3 +166,4 @@ pub fn spawn_conpty(cmdline: &str, cols: i16, rows: i16) -> Result<TabPty> {
         })
     }
 }
+

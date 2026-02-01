@@ -88,7 +88,8 @@ fn main() -> windows::core::Result<()> {
     println!("Spawning ConPTY {}x{}...", cols, rows);
     let pty = spawn_conpty("cmd.exe", cols as i16, rows as i16)?;
 
-    // We capture the raw value of the output handle for the reader thread.
+
+ // We capture the raw value of the output handle for the reader thread.
     let out_raw: isize = pty.pty_out_read.0 as isize;
 
     let term = VirtualTerminal::new(cols, rows);
@@ -133,14 +134,22 @@ fn main() -> windows::core::Result<()> {
     )
     .ok();
 
+
     let mut app = app;
     let mut renderer = Renderer::new();
+
+    // Hide cursor once.
+    crossterm::execute!(io::stdout(), cursor::Hide).ok();
+
+    // Track whether we need to redraw.
+    let mut dirty = true;
 
     // 5) Main loop: drain output, handle input, redraw.
     loop {
         // Drain ConPTY output into the virtual terminal.
         while let Ok(bytes) = rx.try_recv() {
             app.active_tab_mut().term.feed_bytes(&bytes);
+            dirty = true;
         }
 
         // Build status line.
@@ -151,11 +160,10 @@ fn main() -> windows::core::Result<()> {
         );
 
         // Handle input if any.
-        if event::poll(Duration::from_millis(10)).unwrap_or(false) {
+        if event::poll(Duration::from_millis(50)).unwrap_or(false) {
             match event::read().unwrap() {
                 Event::Key(KeyEvent { code, kind, .. }) => {
                     if kind != KeyEventKind::Press {
-                        // ignore repeats / releases
                         continue;
                     }
 
@@ -166,9 +174,10 @@ fn main() -> windows::core::Result<()> {
                             let _ = TerminateProcess(child, 0);
                         }
                         disable_raw_mode().ok();
-                        // Optionally clear on exit:
+                        // Show cursor again on exit.
                         crossterm::execute!(
                             io::stdout(),
+                            cursor::Show,
                             crossterm::terminal::Clear(
                                 crossterm::terminal::ClearType::All
                             ),
@@ -195,23 +204,27 @@ fn main() -> windows::core::Result<()> {
                         KeyCode::Down => write_all(pty_in, b"\x1b[B"),
                         _ => {}
                     }
+
+                    dirty = true;
                 }
 
                 Event::Resize(new_cols, new_rows) => {
-                    // Resize VT
                     app.active_tab_mut().term.resize(new_cols, new_rows);
-                    // Resize ConPTY
                     let _ = app
                         .active_tab()
                         .pty
                         .resize(new_cols as i16, new_rows as i16);
+                    dirty = true;
                 }
 
                 _ => {}
             }
         }
 
-        // Redraw from the VT model.
-        renderer.draw(&app.active_tab().term, &status_line).ok();
+        // Redraw only when something changed.
+        if dirty {
+            renderer.draw(&app.active_tab().term, &status_line).ok();
+            dirty = false;
+        }
     }
 }

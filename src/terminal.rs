@@ -13,7 +13,7 @@ impl VirtualTerminal {
         Self {
             cols,
             rows,
-            lines: Vec::new(),
+            lines: vec![String::new()],
         }
     }
 
@@ -22,15 +22,14 @@ impl VirtualTerminal {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.cols = cols;
-        self.rows = rows;
-        // For now, just keep the existing lines, but trim to new visible height.
-        let max_visible = rows.saturating_sub(1) as usize; // leave room for status bar in renderer
-        if self.lines.len() > max_visible {
-            let drop = self.lines.len() - max_visible;
-            self.lines.drain(0..drop);
+            self.cols = cols;
+            self.rows = rows;
+            let max_visible = rows.saturating_sub(1) as usize;
+            if max_visible > 0 && self.lines.len() > max_visible {
+                let drop = self.lines.len() - max_visible;
+                self.lines.drain(0..drop);
+            }
         }
-    }
 
     /// Feed raw bytes from ConPTY into our model.
     /// For now:
@@ -43,27 +42,33 @@ impl VirtualTerminal {
         }
 
         let s = String::from_utf8_lossy(bytes);
-        for chunk in s.split('\n') {
-            // Strip trailing '\r'
-            let chunk = chunk.trim_end_matches('\r');
 
-            if self.lines.is_empty() {
-                self.lines.push(String::new());
-            }
-
-            // Append to the current last line.
-            if let Some(last) = self.lines.last_mut() {
-                last.push_str(chunk);
-            }
-
-            // Every '\n' starts a new line; split() discards it so we
-            // simulate that by pushing a new line after each chunk.
+        // Ensure we have at least one line.
+        if self.lines.is_empty() {
             self.lines.push(String::new());
+        }
+
+        for ch in s.chars() {
+            match ch {
+                '\n' => {
+                    // New logical line.
+                    self.lines.push(String::new());
+                }
+                '\r' => {
+                    // Carriage return: for now, just ignore (real VT would move cursor).
+                    // Later, when you replace this with a proper VT parser, this logic goes away.
+                }
+                _ => {
+                    if let Some(last) = self.lines.last_mut() {
+                        last.push(ch);
+                    }
+                }
+            }
         }
 
         // Cap visible lines to `rows - 1`
         let max_visible = self.rows.saturating_sub(1) as usize;
-        if self.lines.len() > max_visible && max_visible > 0 {
+        if max_visible > 0 && self.lines.len() > max_visible {
             let drop = self.lines.len() - max_visible;
             self.lines.drain(0..drop);
         }

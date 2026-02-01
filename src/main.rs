@@ -1,66 +1,56 @@
+// src/main.rs
 mod conpty;
+mod terminal;
+mod renderer;
 
 use conpty::{spawn_conpty, TabPty};
+use terminal::VirtualTerminal;
+use renderer::Renderer;
 
 use core::ffi::c_void;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    queue,
-    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
-    GetConsoleMode,
-    GetConsoleScreenBufferInfo,
-    GetStdHandle,
-    SetConsoleMode,
-    CONSOLE_SCREEN_BUFFER_INFO,
-    CONSOLE_MODE,
-    ENABLE_PROCESSED_OUTPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    STD_OUTPUT_HANDLE,
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode,
+    CONSOLE_SCREEN_BUFFER_INFO, CONSOLE_MODE, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Threading::TerminateProcess;
 
-/// Runtime state for the child terminals (tabs).
+struct Tab {
+    pty: TabPty,
+    term: VirtualTerminal,
+}
+
 struct App {
-    tabs: Vec<TabPty>,
+    tabs: Vec<Tab>,
     active: usize,
 }
 
-/// Helper: access active tab.
 impl App {
-    fn active_tab(&self) -> &TabPty {
+    fn active_tab(&self) -> &Tab {
         &self.tabs[self.active]
+    }
+
+    fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
     }
 }
 
-/// Minimal state the status bar needs, shared between threads.
-#[derive(Clone, Copy)]
-struct StatusBarState {
-    cols: u16,
-    rows: u16,
-    active: usize,
-    tab_count: usize,
-}
-
-type StatusHandle = Arc<Mutex<StatusBarState>>;
-type IoLock = Arc<Mutex<()>>;
-
-/// Enable VT sequences (like scroll regions) on the host console.
+/// Enable VT sequences on host console.
 fn enable_vt_mode() {
     unsafe {
         if let Ok(h) = GetStdHandle(STD_OUTPUT_HANDLE) {
-            // CONSOLE_MODE is a newtype around u32
             let mut mode = CONSOLE_MODE(0);
-
             if GetConsoleMode(h, &mut mode).is_ok() {
                 let new_mode =
                     mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT;
@@ -71,8 +61,7 @@ fn enable_vt_mode() {
 }
 
 fn console_size() -> (u16, u16) {
-    // Prefer crossterm, fall back to Win32 if needed.
-    terminal::size().unwrap_or_else(|_| unsafe {
+    crossterm::terminal::size().unwrap_or_else(|_| unsafe {
         let h = GetStdHandle(STD_OUTPUT_HANDLE).unwrap();
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         let _ = GetConsoleScreenBufferInfo(h, &mut info);
@@ -82,7 +71,7 @@ fn console_size() -> (u16, u16) {
     })
 }
 
-/// Write bytes to a Win32 HANDLE (ConPTY input).
+/// Write bytes to ConPTY input.
 fn write_all(handle: HANDLE, bytes: &[u8]) {
     unsafe {
         let mut written = 0u32;
@@ -90,230 +79,107 @@ fn write_all(handle: HANDLE, bytes: &[u8]) {
     }
 }
 
-/// Configure VT scroll region so that only rows 1..(rows-1) scroll.
-/// Last physical row is reserved for the status bar.
-fn configure_scroll_region(rows: u16, io_lock: &IoLock) {
-    let _guard = io_lock.lock().unwrap();
-    let mut stdout = io::stdout();
-
-    if rows >= 2 {
-        let bottom = rows - 1; // 1-based, last scrollable row
-        // DECSTBM: ESC [ <top> ; <bottom> r
-        let seq = format!("\x1b[1;{}r", bottom);
-        let _ = stdout.write_all(seq.as_bytes());
-        let _ = stdout.flush();
-    } else {
-        // Degenerate case: reset scroll region
-        let _ = stdout.write_all(b"\x1b[r");
-        let _ = stdout.flush();
-    }
-}
-
-/// Reset scroll region back to full-screen (used when exiting).
-fn reset_scroll_region(io_lock: &IoLock) {
-    let _guard = io_lock.lock().unwrap();
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(b"\x1b[r");
-    let _ = stdout.flush();
-}
-
-/// Draw the status bar on the bottom line, using shared state.
-/// This version acquires the I/O lock itself.
-fn draw_status_bar(status: &StatusHandle, io_lock: &IoLock) {
-    let snap = {
-        // snapshot under the mutex, then drop the lock
-        let s = status.lock().unwrap();
-        *s
-    };
-
-    let _guard = io_lock.lock().unwrap(); // only one writer at a time
-    let mut stdout = io::stdout();
-
-    // Live size if possible, snapshot as fallback.
-    let (cols_u16, rows_u16) = terminal::size().unwrap_or((snap.cols, snap.rows));
-    let last_row = rows_u16.saturating_sub(1);
-
-    let text = format!(
-        "[myux] tab {}/{} | F10: quit",
-        snap.active + 1,
-        snap.tab_count.max(1),
-    );
-
-    let mut line = text;
-    let cols = cols_u16 as usize;
-    if line.len() < cols {
-        line.push_str(&" ".repeat(cols - line.len()));
-    } else {
-        line.truncate(cols);
-    }
-
-    let _ = queue!(
-        stdout,
-        cursor::SavePosition,
-        cursor::MoveTo(0, last_row),
-        Clear(ClearType::CurrentLine),
-        SetBackgroundColor(Color::DarkGrey),
-        SetForegroundColor(Color::White),
-    );
-    let _ = write!(stdout, "{}", line);
-    let _ = queue!(stdout, ResetColor, cursor::RestorePosition);
-    let _ = stdout.flush();
-}
-
-/// Draw the status bar assuming the caller already holds the I/O lock
-/// and has a stdout handle. Used by the reader thread.
-fn draw_status_bar_locked(status: &StatusHandle, stdout: &mut io::Stdout) {
-    let snap = {
-        let s = status.lock().unwrap();
-        *s
-    };
-
-    let (cols_u16, rows_u16) = terminal::size().unwrap_or((snap.cols, snap.rows));
-    let last_row = rows_u16.saturating_sub(1);
-
-    let text = format!(
-        "[myux] tab {}/{} | F10: quit",
-        snap.active + 1,
-        snap.tab_count.max(1),
-    );
-
-    let mut line = text;
-    let cols = cols_u16 as usize;
-    if line.len() < cols {
-        line.push_str(&" ".repeat(cols - line.len()));
-    } else {
-        line.truncate(cols);
-    }
-
-    let _ = queue!(
-        stdout,
-        cursor::SavePosition,
-        cursor::MoveTo(0, last_row),
-        Clear(ClearType::CurrentLine),
-        SetBackgroundColor(Color::DarkGrey),
-        SetForegroundColor(Color::White),
-    );
-    let _ = write!(stdout, "{}", line);
-    let _ = queue!(stdout, ResetColor, cursor::RestorePosition);
-    let _ = stdout.flush();
-}
-
-/// Clear the status bar line (used when exiting).
-fn clear_status_bar(status: &StatusHandle, io_lock: &IoLock) {
-    let snap = {
-        let s = status.lock().unwrap();
-        *s
-    };
-
-    let _guard = io_lock.lock().unwrap();
-    let mut stdout = io::stdout();
-    let (_cols_u16, rows_u16) = terminal::size().unwrap_or((snap.cols, snap.rows));
-    let last_row = rows_u16.saturating_sub(1);
-
-    let _ = queue!(
-        stdout,
-        cursor::SavePosition,
-        cursor::MoveTo(0, last_row),
-        Clear(ClearType::CurrentLine),
-        cursor::RestorePosition,
-    );
-    let _ = stdout.flush();
-}
-
 fn main() -> windows::core::Result<()> {
-    // Enable VT processing so scroll regions & colors work properly.
+    // 1) Enable VT on host console and get size.
     enable_vt_mode();
-
-    // 1) Visible console size, reserve last row for status bar.
     let (cols, rows) = console_size();
-    let conpty_rows: i16 = (rows as i16 - 1).max(1); // one less than host window
 
-    println!(
-        "Spawning ConPTY {}x{} (ConPTY rows {})...",
-        cols, rows, conpty_rows
-    );
-    let first_tab = spawn_conpty("cmd.exe", cols as i16, conpty_rows)?; // swap to "pwsh.exe" later
+    // 2) Spawn a single ConPTY-backed cmd.exe.
+    println!("Spawning ConPTY {}x{}...", cols, rows);
+    let pty = spawn_conpty("cmd.exe", cols as i16, rows as i16)?;
 
-    let out_raw: isize = first_tab.pty_out_read.0 as isize;
+    // We capture the raw value of the output handle for the reader thread.
+    let out_raw: isize = pty.pty_out_read.0 as isize;
 
+    let term = VirtualTerminal::new(cols, rows);
     let app = App {
-        tabs: vec![first_tab],
+        tabs: vec![Tab { pty, term }],
         active: 0,
     };
 
-    // Shared status bar state (used by both threads)
-    let status: StatusHandle = Arc::new(Mutex::new(StatusBarState {
-        cols,
-        rows,
-        active: 0,
-        tab_count: 1,
-    }));
+    // 3) Channel: reader thread → main thread.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
-    // Shared I/O lock so only one thread writes to the console at a time
-    let io_lock: IoLock = Arc::new(Mutex::new(()));
-
-    // 2) Enable raw mode, configure scroll region, and draw initial status bar
-    terminal::enable_raw_mode().unwrap();
-    configure_scroll_region(rows, &io_lock);
-    draw_status_bar(&status, &io_lock);
-
-    // 3) Reader thread: ConPTY output → stdout, then redraw bar
-    let status_for_reader = Arc::clone(&status);
-    let io_lock_for_reader = Arc::clone(&io_lock);
+    // Reader thread: ReadFile from ConPTY → send Vec<u8> via channel.
     let _reader = thread::spawn(move || {
         let out_handle = HANDLE(out_raw as *mut c_void);
         let mut buf = [0u8; 8192];
 
         loop {
-            unsafe {
-                let mut read = 0u32;
+            let mut read = 0u32;
+            let res = unsafe { ReadFile(out_handle, Some(&mut buf), Some(&mut read), None) };
 
-                let res = ReadFile(out_handle, Some(&mut buf), Some(&mut read), None);
+            if let Err(err) = res {
+                eprintln!("[reader] ReadFile error: {err:?}");
+                break;
+            }
+            if read == 0 {
+                break;
+            }
 
-                if let Err(err) = res {
-                    eprintln!("[reader] ReadFile error: {err:?}");
-                    break;
-                }
-
-                if read == 0 {
-                    break;
-                }
-
-                // Keep all writes + status-bar draw atomic
-                let _guard = io_lock_for_reader.lock().unwrap();
-                let mut stdout = io::stdout();
-
-                let _ = stdout.write_all(&buf[..read as usize]);
-                let _ = stdout.flush();
-
-                // Keep bar pinned at bottom after each burst of output
-                draw_status_bar_locked(&status_for_reader, &mut stdout);
+            let chunk = buf[..read as usize].to_vec();
+            if tx.send(chunk).is_err() {
+                break;
             }
         }
     });
 
-    // 4) Main input loop: F10 quits, other keys go into the child
+    // 4) Terminal setup in main thread.
+    enable_raw_mode().unwrap();
+    // Clear once; Renderer will take over.
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    )
+    .ok();
+
+    let mut app = app;
+    let mut renderer = Renderer::new();
+
+    // 5) Main loop: drain output, handle input, redraw.
     loop {
-        if event::poll(Duration::from_millis(16)).unwrap() {
+        // Drain ConPTY output into the virtual terminal.
+        while let Ok(bytes) = rx.try_recv() {
+            app.active_tab_mut().term.feed_bytes(&bytes);
+        }
+
+        // Build status line.
+        let status_line = format!(
+            "[myux] tab {}/{} | F10: quit",
+            app.active + 1,
+            app.tabs.len()
+        );
+
+        // Handle input if any.
+        if event::poll(Duration::from_millis(10)).unwrap_or(false) {
             match event::read().unwrap() {
                 Event::Key(KeyEvent { code, kind, .. }) => {
                     if kind != KeyEventKind::Press {
+                        // ignore repeats / releases
                         continue;
                     }
 
-                    // Brutal quit on F10
                     if code == KeyCode::F(10) {
+                        // Brutal quit: kill child, restore console.
                         unsafe {
-                            let _ = TerminateProcess(app.active_tab().child_process, 0);
+                            let child = app.active_tab().pty.child_process;
+                            let _ = TerminateProcess(child, 0);
                         }
-                        clear_status_bar(&status, &io_lock);
-                        reset_scroll_region(&io_lock);
-                        let _ = terminal::disable_raw_mode();
-                        std::process::exit(0);
+                        disable_raw_mode().ok();
+                        // Optionally clear on exit:
+                        crossterm::execute!(
+                            io::stdout(),
+                            crossterm::terminal::Clear(
+                                crossterm::terminal::ClearType::All
+                            ),
+                            crossterm::cursor::MoveTo(0, 0),
+                        )
+                        .ok();
+                        return Ok(());
                     }
 
-                    let pty_in = app.active_tab().pty_in_write;
-
+                    // Forward basic keys to ConPTY.
+                    let pty_in = app.active_tab().pty.pty_in_write;
                     match code {
                         KeyCode::Enter => write_all(pty_in, b"\r"),
                         KeyCode::Backspace => write_all(pty_in, &[0x08]),
@@ -329,30 +195,23 @@ fn main() -> windows::core::Result<()> {
                         KeyCode::Down => write_all(pty_in, b"\x1b[B"),
                         _ => {}
                     }
-
-                    // Main thread redraw too (after a keypress)
-                    draw_status_bar(&status, &io_lock);
                 }
+
                 Event::Resize(new_cols, new_rows) => {
-                    // Update status bar state
-                    {
-                        let mut s = status.lock().unwrap();
-                        s.cols = new_cols;
-                        s.rows = new_rows;
-                        s.active = app.active;
-                        s.tab_count = app.tabs.len();
-                    }
-
-                    // Resize the pseudo console (still reserving bottom row)
-                    let conpty_rows = (new_rows as i16 - 1).max(1);
-                    let _ = app.active_tab().resize(new_cols as i16, conpty_rows);
-
-                    // Update scroll region and redraw bar
-                    configure_scroll_region(new_rows, &io_lock);
-                    draw_status_bar(&status, &io_lock);
+                    // Resize VT
+                    app.active_tab_mut().term.resize(new_cols, new_rows);
+                    // Resize ConPTY
+                    let _ = app
+                        .active_tab()
+                        .pty
+                        .resize(new_cols as i16, new_rows as i16);
                 }
+
                 _ => {}
             }
         }
+
+        // Redraw from the VT model.
+        renderer.draw(&app.active_tab().term, &status_line).ok();
     }
 }

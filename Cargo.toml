@@ -18,4 +18,4 @@ windows = { version = "0.58", features = [
 ]}
 
 crossterm = "0.28"
-vt100 = "0.15"
+vt100 = "0.16"

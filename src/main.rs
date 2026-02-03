@@ -32,9 +32,15 @@ struct Tab {
     term: VirtualTerminal,
 }
 
+enum Mode {
+    Normal,
+    Scrollback,
+}
+
 struct App {
     tabs: Vec<Tab>,
     active: usize,
+    mode: Mode,
 }
 
 impl App {
@@ -116,6 +122,7 @@ fn main() -> windows::core::Result<()> {
     let app = App {
         tabs: vec![Tab { pty, term }],
         active: 0,
+        mode: Mode::Normal,
     };
 
     // 3) Channel: reader thread → main thread.
@@ -171,11 +178,17 @@ fn main() -> windows::core::Result<()> {
             dirty = true;
         }
 
-        // Build status line.
+        // Build status line (include mode).
+        let mode_str = match app.mode {
+            Mode::Normal => "normal",
+            Mode::Scrollback => "scroll",
+        };
+
         let status_line = format!(
-            "[myux] tab {}/{} | F10: quit",
+            "[myux] tab {}/{} | mode: {} | F10: quit",
             app.active + 1,
-            app.tabs.len()
+            app.tabs.len(),
+            mode_str,
         );
 
         // Handle input if any.
@@ -187,8 +200,8 @@ fn main() -> windows::core::Result<()> {
                         continue;
                     }
 
+                    // Global: F10 quits.
                     if code == KeyCode::F(10) {
-                        // Brutal quit: kill child, restore console.
                         unsafe {
                             let child = app.active_tab().pty.child_process;
                             let _ = TerminateProcess(child, 0);
@@ -206,7 +219,50 @@ fn main() -> windows::core::Result<()> {
                         return Ok(());
                     }
 
-                    // Forward basic keys to ConPTY.
+                    // -------- Scrollback mode handling --------
+                    match app.mode {
+                        Mode::Normal => {
+                            match code {
+                                // Enter scrollback mode on PageUp
+                                KeyCode::PageUp => {
+                                    app.mode = Mode::Scrollback;
+                                    app.active_tab_mut().term.scroll_up(5);
+                                    dirty = true;
+                                    continue; // don't send PageUp to the child
+                                }
+                                _ => { /* fall through to normal key handling */ }
+                            }
+                        }
+                        Mode::Scrollback => {
+                            match code {
+                                KeyCode::PageUp => {
+                                    app.active_tab_mut().term.scroll_up(5);
+                                    dirty = true;
+                                    continue;
+                                }
+                                KeyCode::PageDown => {
+                                    app.active_tab_mut().term.scroll_down(5);
+                                    if app.active_tab().term.is_at_bottom() {
+                                        app.mode = Mode::Normal;
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    app.active_tab_mut().term.reset_scrollback();
+                                    app.mode = Mode::Normal;
+                                    dirty = true;
+                                    continue;
+                                }
+                                _ => {
+                                    // while in scrollback, ignore all other keys
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // -------- Normal key → ConPTY --------
                     let pty_in = app.active_tab().pty.pty_in_write;
                     match code {
                         KeyCode::Enter => write_all(pty_in, b"\r"),

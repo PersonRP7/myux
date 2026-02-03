@@ -1,6 +1,7 @@
 // src/terminal.rs
 
 use vt100::Parser;
+const SCROLLBACK_LEN: usize = 2000; // or whatever
 
 /// A virtual terminal backed by vt100.
 /// - `rows` / `cols` are the *physical* console size.
@@ -19,7 +20,7 @@ impl VirtualTerminal {
         let term_rows = rows.saturating_sub(1).max(1);
 
         // vt100 takes: height, width, history.
-        let parser = Parser::new(term_rows as u16, cols as u16, 0);
+        let parser = Parser::new(term_rows as u16, cols as u16, SCROLLBACK_LEN);
 
         Self {
             parser,
@@ -48,11 +49,34 @@ impl VirtualTerminal {
     }
 
     /// Feed raw bytes from ConPTY into the VT parser.
+    /// Feed raw bytes from ConPTY into the VT parser.
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
+
+        // If we're currently at the live view, keep following the bottom.
+        if self.is_at_bottom() {
+            self.reset_scrollback();
+        }
+
         self.parser.process(bytes);
+    }
+    // ---------- Scrollback control ----------
+    fn current_scrollback(&self) -> usize {
+        // On this vt100 version scrollback offset is on the parser's screen.
+        // Use the parser.screen() accessor to get the scrollback offset.
+        self.parser.screen().scrollback()
+    }
+
+    /// Jump back to the live view (bottom).
+    pub fn reset_scrollback(&mut self) {
+        self.parser.set_scrollback(0);
+    }
+
+    /// Are we currently looking at the live view?
+    pub fn is_at_bottom(&self) -> bool {
+        self.current_scrollback() == 0
     }
 
     /// Render the current screen contents (no status bar) as plain text lines.

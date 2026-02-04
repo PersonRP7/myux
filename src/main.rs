@@ -10,7 +10,17 @@ use terminal::VirtualTerminal;
 use core::ffi::c_void;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    event::{
+        self,
+        EnableMouseCapture,
+        DisableMouseCapture,
+        Event,
+        KeyCode,
+        KeyEvent,
+        KeyEventKind,
+        MouseEvent,
+        MouseEventKind,
+    },
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use std::io;
@@ -31,6 +41,8 @@ struct Tab {
     pty: TabPty,
     term: VirtualTerminal,
 }
+
+const SCROLL_STEP: u16 = 5;
 
 enum Mode {
     Normal,
@@ -154,10 +166,11 @@ fn main() -> windows::core::Result<()> {
 
     // 4) Terminal setup in main thread.
     enable_raw_mode().unwrap();
-    // Clear once; Renderer will take over.
+    // Clear once & enable mouse; Renderer will take over.
     crossterm::execute!(
         io::stdout(),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        EnableMouseCapture,
     )
     .ok();
 
@@ -209,6 +222,7 @@ fn main() -> windows::core::Result<()> {
                         disable_raw_mode().ok();
                         crossterm::execute!(
                             io::stdout(),
+                            DisableMouseCapture,
                             cursor::Show,
                             crossterm::terminal::Clear(
                                 crossterm::terminal::ClearType::All
@@ -282,6 +296,44 @@ fn main() -> windows::core::Result<()> {
 
                     dirty = true;
                 }
+
+                Event::Mouse(mouse) => {
+                        use MouseEventKind::*;
+
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                match app.mode {
+                                    Mode::Normal => {
+                                        // Same as first PageUp: enter scrollback mode.
+                                        app.mode = Mode::Scrollback;
+                                        app.active_tab_mut().term.scroll_up(SCROLL_STEP);
+                                    }
+                                    Mode::Scrollback => {
+                                        app.active_tab_mut().term.scroll_up(SCROLL_STEP);
+                                    }
+                                }
+                                dirty = true;
+                            }
+                            MouseEventKind::ScrollDown => {
+                                match app.mode {
+                                    Mode::Normal => {
+                                        // In normal mode at bottom: you could choose to ignore,
+                                        // or later, pass wheel to child. For now: ignore.
+                                    }
+                                    Mode::Scrollback => {
+                                        app.active_tab_mut().term.scroll_down(SCROLL_STEP);
+                                        if app.active_tab().term.is_at_bottom() {
+                                            app.mode = Mode::Normal;
+                                        }
+                                        dirty = true;
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Ignore other mouse events for now (clicks, moves).
+                            }
+                        }
+                    }
 
                 Event::Resize(new_cols, new_rows) => {
                     // Resize VT

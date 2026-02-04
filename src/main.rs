@@ -291,6 +291,7 @@ fn main() -> windows::core::Result<()> {
                         KeyCode::Right => write_all(pty_in, b"\x1b[C"),
                         KeyCode::Up => write_all(pty_in, b"\x1b[A"),
                         KeyCode::Down => write_all(pty_in, b"\x1b[B"),
+                        KeyCode::Esc => write_all(pty_in, b"\x1b"),
                         _ => {}
                     }
 

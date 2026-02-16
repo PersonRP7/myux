@@ -62,6 +62,15 @@ impl Renderer {
         write!(stdout, "{}", status)?;
         queue!(stdout, ResetColor)?;
 
+        let (cur_row, cur_col) = term.cursor_pos();
+
+        // keep cursor out of the status bar row:
+        let max_row = rows_u16.saturating_sub(2);
+        let row = cur_row.min(max_row);
+        let col = cur_col.min((cols as u16).saturating_sub(1));
+
+        queue!(stdout, cursor::MoveTo(col, row), cursor::Show)?;
+
         stdout.flush()?;
         Ok(())
     }

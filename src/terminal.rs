@@ -31,6 +31,11 @@ impl VirtualTerminal {
         }
     }
 
+    pub fn cursor_pos(&self) -> (u16, u16) {
+        // vt100 uses (row, col)
+        self.parser.screen().cursor_position()
+    }
+
     /// Physical console size (what the renderer cares about).
     pub fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
@@ -125,9 +130,9 @@ impl VirtualTerminal {
             }
 
             // Trim trailing spaces for aesthetics.
-            while line.ends_with(' ') {
-                line.pop();
-            }
+            // while line.ends_with(' ') {
+            //     line.pop();
+            // }
 
             out.push(line);
         }

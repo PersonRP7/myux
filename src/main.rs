@@ -53,6 +53,7 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     mode: Mode,
+    last_key: Option<(KeyCode, KeyEventKind)>,
 }
 
 impl App {
@@ -135,6 +136,7 @@ fn main() -> windows::core::Result<()> {
         tabs: vec![Tab { pty, term }],
         active: 0,
         mode: Mode::Normal,
+        last_key: None,
     };
 
     // 3) Channel: reader thread → main thread.
@@ -178,7 +180,7 @@ fn main() -> windows::core::Result<()> {
     let mut renderer = Renderer::new();
 
     // Hide cursor once; renderer no longer hides it every frame.
-    crossterm::execute!(io::stdout(), cursor::Hide).ok();
+    // crossterm::execute!(io::stdout(), cursor::Hide).ok();
 
     // Track whether we need to redraw.
     let mut dirty = true;
@@ -197,19 +199,35 @@ fn main() -> windows::core::Result<()> {
             Mode::Scrollback => "scroll",
         };
 
+        let key_dbg = match app.last_key {
+            Some((c, k)) => format!(" | key: {:?} {:?}", c, k),
+            None => "".to_string(),
+        };
+
         let status_line = format!(
-            "[myux] tab {}/{} | mode: {} | F10: quit",
+            "[myux] tab {}/{} | mode: {} | F10: quit{}",
             app.active + 1,
             app.tabs.len(),
             mode_str,
+            key_dbg,
         );
+
+        // let status_line = format!(
+        //     "[myux] tab {}/{} | mode: {} | F10: quit",
+        //     app.active + 1,
+        //     app.tabs.len(),
+        //     mode_str,
+        // );
 
         // Handle input if any.
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {
             match event::read().unwrap() {
                 Event::Key(KeyEvent { code, kind, .. }) => {
-                    if kind != KeyEventKind::Press {
-                        // ignore repeats / releases
+                    // if kind != KeyEventKind::Press {
+                    //     // ignore repeats / releases
+                    //     continue;
+                    // }
+                    if kind == KeyEventKind::Release {
                         continue;
                     }
 
@@ -283,9 +301,13 @@ fn main() -> windows::core::Result<()> {
                         KeyCode::Backspace => write_all(pty_in, &[0x08]),
                         KeyCode::Tab => write_all(pty_in, b"\t"),
                         KeyCode::Char(c) => {
-                            let mut s = [0u8; 4];
-                            let n = c.encode_utf8(&mut s).len();
-                            write_all(pty_in, &s[..n]);
+                            if c == ' ' {
+                                write_all(pty_in, b"<SP>");
+                            } else {
+                                let mut s = [0u8; 4];
+                                let n = c.encode_utf8(&mut s).len();
+                                write_all(pty_in, &s[..n]);
+                            }
                         }
                         KeyCode::Left => write_all(pty_in, b"\x1b[D"),
                         KeyCode::Right => write_all(pty_in, b"\x1b[C"),

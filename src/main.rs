@@ -125,7 +125,8 @@ fn main() -> windows::core::Result<()> {
     let (cols, rows) = console_size();
 
     // 2) Spawn a single ConPTY-backed cmd.exe.
-    println!("Spawning ConPTY {}x{}...", cols, rows);
+    // println!("Spawning ConPTY {}x{}...", cols, rows);
+    eprintln!("Spawning ConPTY {}x{}...", cols, rows);
     let pty = spawn_conpty("cmd.exe", cols as i16, rows as i16)?;
 
     // We capture the raw value of the output handle for the reader thread.
@@ -172,6 +173,7 @@ fn main() -> windows::core::Result<()> {
     crossterm::execute!(
         io::stdout(),
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0),
         EnableMouseCapture,
     )
     .ok();
@@ -199,8 +201,8 @@ fn main() -> windows::core::Result<()> {
             Mode::Scrollback => "scroll",
         };
 
-        let key_dbg = match app.last_key {
-            Some((c, k)) => format!(" | key: {:?} {:?}", c, k),
+        let key_dbg = match &app.last_key {
+            Some((c, k)) => format!(" | key={:?} kind={:?}", c, k),
             None => "".to_string(),
         };
 
@@ -223,13 +225,12 @@ fn main() -> windows::core::Result<()> {
         if event::poll(Duration::from_millis(50)).unwrap_or(false) {
             match event::read().unwrap() {
                 Event::Key(KeyEvent { code, kind, .. }) => {
-                    // if kind != KeyEventKind::Press {
-                    //     // ignore repeats / releases
-                    //     continue;
-                    // }
+
+                    app.last_key = Some((code, kind));
                     if kind == KeyEventKind::Release {
                         continue;
                     }
+
 
                     // Global: F10 quits.
                     if code == KeyCode::F(10) {
@@ -300,15 +301,15 @@ fn main() -> windows::core::Result<()> {
                         KeyCode::Enter => write_all(pty_in, b"\r"),
                         KeyCode::Backspace => write_all(pty_in, &[0x08]),
                         KeyCode::Tab => write_all(pty_in, b"\t"),
+
+                        KeyCode::Char(' ') => write_all(pty_in, &[0x20]), // <-- ADD THIS
+
                         KeyCode::Char(c) => {
-                            if c == ' ' {
-                                write_all(pty_in, &[0x20]);
-                            } else {
-                                let mut s = [0u8; 4];
-                                let n = c.encode_utf8(&mut s).len();
-                                write_all(pty_in, &s[..n]);
-                            }
+                            let mut s = [0u8; 4];
+                            let n = c.encode_utf8(&mut s).len();
+                            write_all(pty_in, &s[..n]);
                         }
+
                         KeyCode::Left => write_all(pty_in, b"\x1b[D"),
                         KeyCode::Right => write_all(pty_in, b"\x1b[C"),
                         KeyCode::Up => write_all(pty_in, b"\x1b[A"),

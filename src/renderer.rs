@@ -27,20 +27,16 @@ impl Renderer {
         let lines = term.render_lines();
         let usable_height = rows_u16.saturating_sub(1) as usize; // last line for status
 
-        // Draw child terminal lines, top-aligned.
         for row in 0..usable_height {
-            queue!(stdout, cursor::MoveTo(0, row as u16))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(0, row as u16),
+                Clear(ClearType::CurrentLine),
+            )?;
 
-            let text = if row < lines.len() { &lines[row] } else { "" };
-
-            let mut line = text.to_string();
-            if line.len() < cols {
-                line.push_str(&" ".repeat(cols - line.len()));
-            } else {
-                line.truncate(cols);
+            if row < lines.len() {
+                write!(stdout, "{}", lines[row])?;
             }
-
-            write!(stdout, "{}", line)?;
         }
 
         // Status bar on the last line.

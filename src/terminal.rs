@@ -102,37 +102,10 @@ impl VirtualTerminal {
     }
 
     // ---------- Rendering ----------
-
-    /// Render the current screen contents (no status bar) as plain text lines.
-    /// This already respects the current scrollback offset.
     pub fn render_lines(&self) -> Vec<String> {
-        let screen = self.parser.screen();
-        let rows = self.term_rows;
-        let cols = self.cols;
-
-        let mut out = Vec::with_capacity(rows as usize);
-
-        for row in 0..rows {
-            let mut line = String::with_capacity(cols as usize);
-
-            for col in 0..cols {
-                if let Some(cell) = screen.cell(row, col) {
-                    let ch = cell.contents();
-                    if ch == "\0" {
-                        line.push('·'); // show empty as dot
-                    } else if ch == " " {
-                        line.push('·'); // show real spaces as dot too
-                    } else {
-                        line.push_str(ch);
-                    }
-                } else {
-                    line.push(' ');
-                }
-            }
-
-            out.push(line);
-        }
-
-        out
+        self.parser.screen().contents()
+            .split('\n')
+            .map(|s| s.to_string())
+            .collect()
     }
 }

@@ -302,7 +302,7 @@ fn main() -> windows::core::Result<()> {
                         KeyCode::Tab => write_all(pty_in, b"\t"),
                         KeyCode::Char(c) => {
                             if c == ' ' {
-                                write_all(pty_in, b"<SP>");
+                                write_all(pty_in, &[0x20]);
                             } else {
                                 let mut s = [0u8; 4];
                                 let n = c.encode_utf8(&mut s).len();

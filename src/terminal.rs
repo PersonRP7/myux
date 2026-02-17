@@ -107,32 +107,28 @@ impl VirtualTerminal {
     /// This already respects the current scrollback offset.
     pub fn render_lines(&self) -> Vec<String> {
         let screen = self.parser.screen();
-        let rows = self.term_rows as u16;
-        let cols = self.cols as u16;
+        let rows = self.term_rows;
+        let cols = self.cols;
 
-        let mut out = Vec::with_capacity(self.term_rows as usize);
+        let mut out = Vec::with_capacity(rows as usize);
 
         for row in 0..rows {
-            let mut line = String::new();
+            let mut line = String::with_capacity(cols as usize);
 
             for col in 0..cols {
                 if let Some(cell) = screen.cell(row, col) {
                     let ch = cell.contents();
-                    // vt100 uses "\0" for empty cells.
-                    if ch != "\0" {
-                        line.push_str(&ch);
+                    if ch == "\0" {
+                        line.push('·'); // show empty as dot
+                    } else if ch == " " {
+                        line.push('·'); // show real spaces as dot too
                     } else {
-                        line.push(' ');
+                        line.push_str(ch);
                     }
                 } else {
                     line.push(' ');
                 }
             }
-
-            // Trim trailing spaces for aesthetics.
-            // while line.ends_with(' ') {
-            //     line.pop();
-            // }
 
             out.push(line);
         }

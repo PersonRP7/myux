@@ -123,11 +123,12 @@ fn main() -> windows::core::Result<()> {
     enable_vt_mode();
     clamp_console_buffer_to_window();
     let (cols, rows) = console_size();
+    let term_rows = rows.saturating_sub(1).max(1);
 
     // 2) Spawn a single ConPTY-backed cmd.exe.
     // println!("Spawning ConPTY {}x{}...", cols, rows);
     eprintln!("Spawning ConPTY {}x{}...", cols, rows);
-    let pty = spawn_conpty("cmd.exe", cols as i16, rows as i16)?;
+    let pty = spawn_conpty("cmd.exe", cols as i16, term_rows as i16)?;
 
     // We capture the raw value of the output handle for the reader thread.
     let out_raw: isize = pty.pty_out_read.0 as isize;
@@ -360,13 +361,14 @@ fn main() -> windows::core::Result<()> {
                     }
 
                 Event::Resize(new_cols, new_rows) => {
-                    // Resize VT
                     app.active_tab_mut().term.resize(new_cols, new_rows);
-                    // Resize ConPTY
+
+                    let child_rows = new_rows.saturating_sub(1).max(1);
                     let _ = app
                         .active_tab()
                         .pty
-                        .resize(new_cols as i16, new_rows as i16);
+                        .resize(new_cols as i16, child_rows as i16);
+
                     dirty = true;
                 }
 

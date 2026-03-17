@@ -18,7 +18,6 @@ use crossterm::{
         KeyCode,
         KeyEvent,
         KeyEventKind,
-        MouseEvent,
         MouseEventKind,
     },
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -323,7 +322,6 @@ fn main() -> windows::core::Result<()> {
                 }
 
                 Event::Mouse(mouse) => {
-                        use MouseEventKind::*;
 
                         match mouse.kind {
                             MouseEventKind::ScrollUp => {

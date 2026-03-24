@@ -15,6 +15,26 @@ pub struct VirtualTerminal {
     term_rows: u16, // rows dedicated to the child terminal (rows - 1)
 }
 
+//logger
+fn contains_csi_ech(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1B && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+
+            if j > i + 2 && j < bytes.len() && bytes[j] == b'X' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 impl VirtualTerminal {
     pub fn new(cols: u16, rows: u16) -> Self {
         // At least 1 row for the child.
@@ -61,12 +81,31 @@ impl VirtualTerminal {
             return;
         }
 
-        // If we're at the live view, we keep following the bottom.
         if self.is_at_bottom() {
             self.reset_scrollback();
         }
 
+        let watch = contains_csi_ech(bytes);
+
+        let before = if watch {
+            Some(self.parser.screen().contents().to_string())
+        } else {
+            None
+        };
+
         self.parser.process(bytes);
+
+        if watch {
+            let after = self.parser.screen().contents().to_string();
+            if let Some(before) = before {
+                eprintln!("=== ECH CHUNK ===");
+                eprintln!("BYTES: {:?}", bytes);
+                eprintln!("BEFORE:\n{:?}", before);
+                eprintln!("AFTER:\n{:?}", after);
+                let (row, col) = self.parser.screen().cursor_position();
+                eprintln!("CURSOR: row={} col={}", row, col);
+            }
+        }
     }
 
     // ---------- Scrollback control ----------

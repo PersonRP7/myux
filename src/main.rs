@@ -55,6 +55,25 @@ fn get_log_file() -> &'static Mutex<std::fs::File> {
     })
 }
 
+fn contains_csi_ech(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1B && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+
+            if j > i + 2 && j < bytes.len() && bytes[j] == b'X' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 struct Tab {
     pty: TabPty,
     term: VirtualTerminal,
@@ -86,7 +105,7 @@ impl App {
 
 
 fn debug_bytes(label: &str, bytes: &[u8]) {
-    if bytes.is_empty() {
+    if bytes.is_empty() || !contains_csi_ech(bytes) {
         return;
     }
 

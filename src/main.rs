@@ -36,6 +36,25 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Console::COORD;
 use windows::Win32::System::Threading::TerminateProcess;
 
+//logging
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
+
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+fn get_log_file() -> &'static Mutex<std::fs::File> {
+    LOG_FILE.get_or_init(|| {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("pty.log")
+            .expect("failed to open pty.log");
+        Mutex::new(file)
+    })
+}
+
 struct Tab {
     pty: TabPty,
     term: VirtualTerminal,
@@ -62,6 +81,38 @@ impl App {
 
     fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+}
+
+
+fn debug_bytes(label: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let mut line = format!("[{}] ", label);
+
+    for b in bytes {
+        line.push_str(&format!("{:02X} ", b));
+    }
+
+    line.push_str(" | ");
+
+    for &b in bytes {
+        match b {
+            b'\r' => line.push_str("<CR>"),
+            b'\n' => line.push_str("<LF>"),
+            b'\t' => line.push_str("<TAB>"),
+            0x1B => line.push_str("<ESC>"),
+            0x20..=0x7E => line.push(b as char),
+            _ => line.push('.'),
+        }
+    }
+
+    line.push('\n');
+
+    if let Ok(mut file) = get_log_file().lock() {
+        let _ = std::io::Write::write_all(&mut *file, line.as_bytes());
     }
 }
 
@@ -111,6 +162,7 @@ fn console_size() -> (u16, u16) {
 
 /// Write bytes to ConPTY input.
 fn write_all(handle: HANDLE, bytes: &[u8]) {
+    debug_bytes("HOST->PTY", bytes);
     unsafe {
         let mut written = 0u32;
         let _ = WriteFile(handle, Some(bytes), Some(&mut written), None);
@@ -161,6 +213,7 @@ fn main() -> windows::core::Result<()> {
             }
 
             let chunk = buf[..read as usize].to_vec();
+            debug_bytes("PTY->HOST", &chunk);
             if tx.send(chunk).is_err() {
                 break;
             }

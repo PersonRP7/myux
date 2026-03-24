@@ -127,7 +127,7 @@ fn main() -> windows::core::Result<()> {
     // 2) Spawn a single ConPTY-backed cmd.exe.
     // println!("Spawning ConPTY {}x{}...", cols, rows);
     eprintln!("Spawning ConPTY {}x{}...", cols, rows);
-    let pty = spawn_conpty("cmd.exe", cols as i16, term_rows as i16)?;
+    let pty = spawn_conpty("pwsh.exe", cols as i16, term_rows as i16)?;
 
     // We capture the raw value of the output handle for the reader thread.
     let out_raw: isize = pty.pty_out_read.0 as isize;
@@ -299,7 +299,7 @@ fn main() -> windows::core::Result<()> {
                     let pty_in = app.active_tab().pty.pty_in_write;
                     match code {
                         KeyCode::Enter => write_all(pty_in, b"\r"),
-                        KeyCode::Backspace => write_all(pty_in, &[0x08]),
+                        KeyCode::Backspace => write_all(pty_in, &[0x7f]),
                         KeyCode::Tab => write_all(pty_in, b"\t"),
 
                         KeyCode::Char(' ') => write_all(pty_in, &[0x20]), // <-- ADD THIS

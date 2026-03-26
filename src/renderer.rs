@@ -1,46 +1,40 @@
 // src/renderer.rs
+
 use crate::terminal::VirtualTerminal;
 use crossterm::{
     cursor,
     queue,
-    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{Clear, ClearType},
 };
 use std::io::{self, Write};
+use vt100::Screen;
 
-pub struct Renderer;
+pub struct Renderer {
+    last_screen: Option<Screen>,
+}
 
 impl Renderer {
     pub fn new() -> Self {
-        Renderer
+        Self { last_screen: None }
     }
 
-    /// Redraw the entire screen from the VT model plus a status bar.
     pub fn draw(&mut self, term: &VirtualTerminal, status_line: &str) -> io::Result<()> {
         let (cols, rows) = term.size();
         let cols = cols as usize;
-        let rows_u16 = rows;
+        let status_row = rows.saturating_sub(1);
 
         let mut stdout = io::stdout();
 
-        // Get the already-interpreted terminal contents.
-        let lines = term.render_lines();
-        let usable_height = rows_u16.saturating_sub(1) as usize; // last line for status
+        // Let vt100 produce the terminal redraw bytes.
+        let vt_bytes = match &self.last_screen {
+            Some(prev) => term.diff_render_bytes(prev),
+            None => term.full_render_bytes(),
+        };
 
-        for row in 0..usable_height {
-            queue!(
-                stdout,
-                cursor::MoveTo(0, row as u16),
-                Clear(ClearType::CurrentLine),
-            )?;
+        stdout.write_all(&vt_bytes)?;
 
-            if row < lines.len() {
-                write!(stdout, "{}", lines[row])?;
-            }
-        }
-
-        // Status bar on the last line.
-        let last_row = rows_u16.saturating_sub(1);
+        // Draw status bar without disturbing child cursor position.
         let mut status = status_line.to_string();
         if status.len() < cols {
             status.push_str(&" ".repeat(cols - status.len()));
@@ -50,24 +44,23 @@ impl Renderer {
 
         queue!(
             stdout,
-            cursor::MoveTo(0, last_row),
+            cursor::SavePosition,
+            cursor::MoveTo(0, status_row),
             SetBackgroundColor(Color::DarkGrey),
             SetForegroundColor(Color::White),
             Clear(ClearType::CurrentLine),
+            Print(status),
+            ResetColor,
+            cursor::RestorePosition,
         )?;
-        write!(stdout, "{}", status)?;
-        queue!(stdout, ResetColor)?;
-
-        let (cur_row, cur_col) = term.cursor_pos();
-
-        // keep cursor out of the status bar row:
-        let max_row = rows_u16.saturating_sub(2);
-        let row = cur_row.min(max_row);
-        let col = cur_col.min((cols as u16).saturating_sub(1));
-
-        queue!(stdout, cursor::MoveTo(col, row), cursor::Show)?;
 
         stdout.flush()?;
+
+        self.last_screen = Some(term.snapshot());
         Ok(())
+    }
+
+    pub fn invalidate(&mut self) {
+        self.last_screen = None;
     }
 }

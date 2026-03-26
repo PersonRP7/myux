@@ -439,6 +439,7 @@ fn main() -> windows::core::Result<()> {
                         .pty
                         .resize(new_cols as i16, child_rows as i16);
 
+                    renderer.invalidate();
                     dirty = true;
                 }
 

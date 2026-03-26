@@ -2,6 +2,30 @@
 
 use vt100::Parser;
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
+
+static VT_LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+fn get_vt_log_file() -> &'static Mutex<std::fs::File> {
+    VT_LOG_FILE.get_or_init(|| {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("vt_debug.log")
+            .expect("failed to open vt_debug.log");
+        Mutex::new(file)
+    })
+}
+
+fn log_vt_debug(text: &str) {
+    if let Ok(mut file) = get_vt_log_file().lock() {
+        let _ = file.write_all(text.as_bytes());
+    }
+}
+
 const SCROLLBACK_LEN: usize = 2000; // number of lines of history
 
 /// A virtual terminal backed by vt100.
@@ -98,12 +122,14 @@ impl VirtualTerminal {
         if watch {
             let after = self.parser.screen().contents().to_string();
             if let Some(before) = before {
-                eprintln!("=== ECH CHUNK ===");
-                eprintln!("BYTES: {:?}", bytes);
-                eprintln!("BEFORE:\n{:?}", before);
-                eprintln!("AFTER:\n{:?}", after);
                 let (row, col) = self.parser.screen().cursor_position();
-                eprintln!("CURSOR: row={} col={}", row, col);
+
+                let msg = format!(
+                    "=== ECH CHUNK ===\nBYTES: {:?}\nBEFORE:\n{:?}\nAFTER:\n{:?}\nCURSOR: row={} col={}\n\n",
+                    bytes, before, after, row, col
+                );
+
+                log_vt_debug(&msg);
             }
         }
     }

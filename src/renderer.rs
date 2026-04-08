@@ -26,11 +26,19 @@ impl Renderer {
 
         let mut stdout = io::stdout();
 
+//         let vt_bytes = match &self.last_screen {
+//             Some(prev) => term.diff_render_bytes(prev),
+//             None => term.full_render_bytes(),
+//         };
         // Let vt100 produce the terminal redraw bytes.
-        let vt_bytes = match &self.last_screen {
-            Some(prev) => term.diff_render_bytes(prev),
-            None => term.full_render_bytes(),
-        };
+        // repaints the whole visible terminal state again on
+        // every dirty frame, seems to solve the bug when
+        // pressing backspace on autocompleted text behaves
+        // so that one backspace key press doesn't correlate
+        // directly to one deleted character but instead deletes
+        // the whole line when it reaches some arbitrary limit,
+        // however causes visible churn (jitters).
+        let vt_bytes = term.full_render_bytes();
 
         stdout.write_all(&vt_bytes)?;
 
